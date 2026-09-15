@@ -1,0 +1,28 @@
+name: Crypto Liquidity Bot
+
+on:
+  schedule:
+    - cron: '0 */4 * * *' # Runs every 4 hours automatically
+  workflow_dispatch: # Adds a button so you can trigger it manually anytime
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          
+      - name: Install dependencies
+        run: pip install requests
+        
+      - name: Run Bot
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: python bot.py
+        
