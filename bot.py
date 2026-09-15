@@ -18,16 +18,22 @@ def send_alert(msg):
     requests.post(url, data={'chat_id': CHAT_ID, 'text': msg, 'parse_mode': 'Markdown'})
 
 def analyze_timeframe(symbol, interval):
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit=21"
-    klines = requests.get(url).json()
-    closes = [float(c[4]) for c in klines]
-    volumes = [float(v[5]) for v in klines]
+    # FIXED: Uses Binance's global data URL to bypass US cloud IP blocks
+    url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval={interval}&limit=21"
+    data = requests.get(url).json()
     
-    # Calculate Institutional Trap Zones (20-period highs and lows)
-    lows = [float(c[3]) for c in klines[:-1]]
-    highs = [float(c[2]) for c in klines[:-1]]
-    recent_low = min(lows)
-    recent_high = max(highs)
+    # Catch missing coins (like KITE not being on Spot)
+    if isinstance(data, dict) and 'code' in data:
+        raise Exception("Symbol not found")
+        
+    closes = [float(c[4]) for c in data]
+    volumes = [float(v[5]) for v in data]
+    
+    # Calculate Institutional Trap Zones
+    lows = [float(c[3]) for c in data[:-1]]
+    highs = [float(c[2]) for c in data[:-1]]
+    recent_low = min(lows) if lows else closes[-1]
+    recent_high = max(highs) if highs else closes[-1]
     
     avg_vol = sum(volumes[:-1]) / len(volumes[:-1]) if len(volumes) > 1 else 1
     vol_climax = volumes[-1] > (avg_vol * 1.5)
@@ -35,10 +41,12 @@ def analyze_timeframe(symbol, interval):
     return vol_climax, closes[-1], recent_low, recent_high
 
 def get_spot_liquidity(symbol):
-    ob_url = f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit=100"
+    # FIXED: Uses Binance's global data URL to bypass US cloud IP blocks
+    ob_url = f"https://data-api.binance.vision/api/v3/depth?symbol={symbol}&limit=100"
     ob_data = requests.get(ob_url).json()
-    bids = sum(float(b[1]) for b in ob_data['bids']) 
-    asks = sum(float(a[1]) for a in ob_data['asks']) 
+    
+    bids = sum(float(b[1]) for b in ob_data.get('bids', [])) 
+    asks = sum(float(a[1]) for a in ob_data.get('asks', [])) 
     ratio = bids / asks if asks > 0 else 1.0
     return ratio, bids, asks
 
@@ -51,7 +59,7 @@ def check_market():
             vol_1d, _, low_1d, high_1d = analyze_timeframe(symbol, "1d")
             ratio, bids, asks = get_spot_liquidity(symbol)
             
-            # --- 1. PREDICTIVE AI LOGIC (For Manual Reports) ---
+            # --- PREDICTIVE AI LOGIC ---
             if ratio >= 2.0 and price <= (low_1d * 1.05):
                 prediction = "🟢 *High Probability UP* (Whale Absorption at Support)"
             elif ratio <= 0.5 and price >= (high_1d * 0.95):
@@ -68,27 +76,20 @@ def check_market():
                        f"• Limit Ratio: {ratio:.2f}x\n"
                        f"──────────────\n")
             
-            # --- 2. AUTOMATED INSTITUTIONAL TRAP ALERTS (Strict Entry/Exit) ---
-            # BUY TRIGGER: Price is pushed to 20-day lows + Volume Spikes (Retail panic) + Massive Buy Wall absorbs it
+            # --- AUTOMATED ALERTS (Only triggers on absolute setups) ---
             if price <= (low_1d * 1.03) and vol_1d and ratio >= 2.0:
-                send_alert(f"🟢 *[1D PERFECT ENTRY] : {symbol}*\n\n"
-                           f"Market Maker Trap detected! Retail is panic selling into a massive institutional buy wall at support.\n\n"
-                           f"• *Price:* ${price}\n• *Absorption Ratio:* {ratio:.2f}x\n"
-                           f"• *Spot Bids Defending:* {bids:.0f}")
+                send_alert(f"🟢 *[1D PERFECT ENTRY] : {symbol}*\n\nMarket Maker Trap detected! Retail panic selling into institutional buy wall.\n\n• *Price:* ${price}\n• *Absorption Ratio:* {ratio:.2f}x\n• *Spot Bids Defending:* {bids:.0f}")
                 
-            # SELL TRIGGER: Price is pushed to 20-day highs + Volume Spikes (Retail FOMO) + Massive Sell Wall blocks it
             elif price >= (high_1d * 0.97) and vol_1d and ratio <= 0.5:
-                send_alert(f"🔴 *[1D PERFECT EXIT] : {symbol}*\n\n"
-                           f"Market Maker Distribution! Retail is buying the breakout, but whales are dumping via heavy limit sell walls.\n\n"
-                           f"• *Price:* ${price}\n• *Distribution Ratio:* {(1/ratio):.2f}x\n"
-                           f"• *Spot Asks Blocking:* {asks:.0f}")
+                send_alert(f"🔴 *[1D PERFECT EXIT] : {symbol}*\n\nMarket Maker Distribution! Whales are dumping via heavy limit sell walls.\n\n• *Price:* ${price}\n• *Distribution Ratio:* {(1/ratio):.2f}x\n• *Spot Asks Blocking:* {asks:.0f}")
 
-            time.sleep(1) 
+            time.sleep(1.5) # Spacing requests to be safe
             
         except Exception:
+            # If a coin fails (like KITE on Spot), it reports it but safely moves on to the next one!
+            report += f"🔹 *{symbol}* | ⚠️ Data Not Found on Spot\n──────────────\n"
             continue 
 
-    # Only send the massive multi-coin prediction report if you ran it manually
     if RUN_MODE != 'schedule':
         send_alert(report)
 
