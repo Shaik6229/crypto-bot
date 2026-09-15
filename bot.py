@@ -1,289 +1,596 @@
-import requests
+import json
+import logging
 import os
 import time
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
-CHAT_ID = os.environ.get('CHAT_ID')
-RUN_MODE = os.environ.get('GITHUB_EVENT_NAME', 'workflow_dispatch') 
+# --- LOGGING SETUP ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("CryptoScanner")
 
-# 1. Permanent Core Halal Watchlist
+# --- ENVIRONMENT & EXECUTION MODE ---
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+CHAT_ID = os.environ.get("CHAT_ID")
+RUN_MODE = os.environ.get("GITHUB_EVENT_NAME", "workflow_dispatch")
+STATE_FILE = "bot_state.json"
+
+# --- VETTED ASSET UNIVERSES (Top-Ranked, Shariah-Audited, No Riba/Memes) ---
 CORE_WATCHLIST = [
-    "SOLUSDT", "XRPUSDT", "ADAUSDT", "SUIUSDT", "LINKUSDT", 
-    "XLMUSDT", "ALGOUSDT", "POLUSDT", "FETUSDT", "TONUSDT", 
+    "SOLUSDT", "XRPUSDT", "ADAUSDT", "SUIUSDT", "LINKUSDT",
+    "XLMUSDT", "ALGOUSDT", "POLUSDT", "FETUSDT", "TONUSDT",
     "AVAXUSDT", "NEARUSDT", "KITEUSDT"
 ]
 
-# 2. Vetted Top-350 Halal L1 & L2 Infrastructure Pool (Strictly No Lending/Riba/Memes)
+# Vetted Layer 1 / Layer 2 Infrastructure (ROSE retained here as L1)
 L1_L2_UNIVERSE = [
-    "APTUSDT", "SEIUSDT", "INJUSDT", "TIAUSDT", "ARBUSDT", 
-    "OPUSDT", "HBARUSDT", "ICPUSDT", "KASUSDT", "FTMUSDT", 
-    "EGLDUSDT", "FLOWUSDT", "THETAUSDT", "STXUSDT", "ROSEUSDT",
-    "PENDLEUSDT", "SPLUSDT", "COREUSDT", "CELOUSDT", "SKLUSDT"
+    "APTUSDT", "SEIUSDT", "INJUSDT", "TIAUSDT", "ARBUSDT",
+    "OPUSDT", "HBARUSDT", "ICPUSDT", "KASUSDT", "FTMUSDT",
+    "EGLDUSDT", "FLOWUSDT", "STXUSDT", "ROSEUSDT", "CELOUSDT"
 ]
 
-# 3. Vetted Top-350 Halal AI Pool (Compute, Decentralized ML, Data Indexing)
+# Vetted Decentralized AI / Compute Infrastructure (ROSE removed to avoid overlap)
 AI_UNIVERSE = [
-    "TAOUSDT", "FETUSDT", "RENDERUSDT", "GRTUSDT", "THETAUSDT", 
-    "AKTUSDT", "ARKMUSDT", "GLMUSDT", "RLCUSDT", "IOUSDT", 
-    "JASMYUSDT", "IQUSDT", "NMRUSDT", "PHBUSDT", "CTXCUSDT", 
-    "TRACUSDT", "MDTUSDT", "NULSUSDT", "ROSEUSDT", "PHAUSDT"
+    "TAOUSDT", "RENDERUSDT", "GRTUSDT", "THETAUSDT", "AKTUSDT",
+    "ARKMUSDT", "GLMUSDT", "RLCUSDT", "IOUSDT", "JASMYUSDT",
+    "IQUSDT", "NMRUSDT", "PHBUSDT", "TRACUSDT", "PHAUSDT"
 ]
 
-def send_alert(msg):
+# --- RESILIENT HTTP SESSION ---
+def get_http_session():
+    session = requests.Session()
+    retries = Retry(total=4, backoff_factor=1.5, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+HTTP = get_http_session()
+
+# --- FORMATTING HELPER ---
+def format_price(val):
+    """Formats prices dynamically so low-priced assets retain precision without visual clutter."""
+    if val is None or val == 0:
+        return "0.00"
+    abs_val = abs(val)
+    if abs_val >= 100:
+        return f"{val:,.2f}"
+    elif abs_val >= 1:
+        return f"{val:.4f}"
+    elif abs_val >= 0.01:
+        return f"{val:.4f}"
+    elif abs_val >= 0.0001:
+        return f"{val:.6f}"
+    else:
+        return f"{val:.8f}"
+
+# --- STATE PERSISTENCE (Alert Deduplication & Size-Aware Liquidity) ---
+def load_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"State file load error: {e}")
+    return {}
+
+def save_state(state):
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        logger.warning(f"State file save error: {e}")
+
+STATE = load_state()
+
+def check_alert_cooldown(symbol, signal_type, current_price, atr):
+    last_record = STATE.get(symbol, {}).get("alert", {})
+    if not last_record:
+        return False
+    if last_record.get("signal") != signal_type:
+        return False
+    time_elapsed = time.time() - last_record.get("time", 0)
+    price_moved = abs(current_price - last_record.get("price", 0)) >= (2.0 * atr)
+    if time_elapsed < 43200 and not price_moved:
+        return True
+    return False
+
+def record_alert(symbol, signal_type, price):
+    if symbol not in STATE:
+        STATE[symbol] = {}
+    STATE[symbol]["alert"] = {"signal": signal_type, "price": price, "time": time.time()}
+    save_state(STATE)
+
+def update_liquidity_state(symbol, bid_cluster, ask_cluster):
+    if symbol not in STATE:
+        STATE[symbol] = {}
+    STATE[symbol]["liquidity"] = {
+        "bid": bid_cluster,
+        "ask": ask_cluster,
+        "time": time.time()
+    }
+    save_state(STATE)
+
+# --- TELEGRAM BROADCASTER WITH RETRIES, 429 HANDLING & SAFE CHUNKING ---
+def _send_single_telegram_chunk(text):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     
-    if len(msg) > 4000:
-        chunks = msg.split("──────────────\n")
-        current_chunk = ""
-        for chunk in chunks:
-            if len(current_chunk) + len(chunk) < 4000:
-                current_chunk += chunk + "──────────────\n"
-            else:
-                requests.post(url, data={'chat_id': CHAT_ID, 'text': current_chunk, 'parse_mode': 'Markdown'})
-                current_chunk = chunk + "──────────────\n"
-                time.sleep(1)
-        if current_chunk.strip():
-            requests.post(url, data={'chat_id': CHAT_ID, 'text': current_chunk, 'parse_mode': 'Markdown'})
-    else:
-        requests.post(url, data={'chat_id': CHAT_ID, 'text': msg, 'parse_mode': 'Markdown'})
+    for attempt in range(1, 4):
+        try:
+            res = HTTP.post(url, data={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=12)
+            
+            # Handle rate-limiting (429)
+            if res.status_code == 429:
+                retry_after = 3
+                try:
+                    retry_after = res.json().get("parameters", {}).get("retry_after", 3)
+                except Exception:
+                    pass
+                logger.warning(f"Telegram 429 rate limit hit. Sleeping {retry_after}s...")
+                time.sleep(retry_after)
+                continue
+                
+            # If Markdown parsing failed (400), resend as plain text fallback
+            if res.status_code == 400 and "can't parse entities" in res.text.lower():
+                logger.warning("Telegram entity parsing failed. Retrying in plain text...")
+                HTTP.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=12)
+                return
 
-def get_dynamic_market_leaders(top_n=5):
-    """Scans L1/L2 and AI pools independently, picking top volume leaders under rank 350."""
-    try:
-        url = "https://data-api.binance.vision/api/v3/ticker/24hr"
-        tickers = requests.get(url).json()
-        
-        # Sort L1/L2 Leaders
-        l1_tickers = [t for t in tickers if t.get('symbol') in L1_L2_UNIVERSE and t.get('symbol') not in CORE_WATCHLIST]
-        l1_tickers.sort(key=lambda x: float(x.get('quoteVolume', 0)), reverse=True)
-        top_l1 = [t['symbol'] for t in l1_tickers[:top_n]]
-        
-        # Sort AI Leaders
-        ai_tickers = [t for t in tickers if t.get('symbol') in AI_UNIVERSE and t.get('symbol') not in CORE_WATCHLIST and t.get('symbol') not in top_l1]
-        ai_tickers.sort(key=lambda x: float(x.get('quoteVolume', 0)), reverse=True)
-        top_ai = [t['symbol'] for t in ai_tickers[:top_n]]
-        
-        return top_l1, top_ai
-    except:
-        return [], []
+            res.raise_for_status()
+            return
+        except requests.RequestException as e:
+            logger.warning(f"Telegram dispatch attempt {attempt} failed: {e}")
+            time.sleep(1.5 * attempt)
+            
+    logger.error("Failed to deliver Telegram alert after 3 attempts.")
 
-def calculate_rsi_series(closes, period=14):
-    if len(closes) < period + 1:
-        return [50] * len(closes)
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i-1]
-        gains.append(max(0, diff))
-        losses.append(max(0, -diff))
-        
-    rsi_series = []
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    rsi_series.append(100 - (100 / (1 + (avg_gain / avg_loss))) if avg_loss != 0 else 100)
+def send_telegram(msg):
+    """Splits oversized messages cleanly along paragraph/line breaks to avoid truncated alerts."""
+    if not msg:
+        return
+
+    max_len = 3800
+    if len(msg) <= max_len:
+        _send_single_telegram_chunk(msg)
+        return
+
+    # Split into clean paragraphs
+    paragraphs = msg.split("\n\n")
+    current_chunk = ""
     
-    for i in range(period, len(gains)):
+    for para in paragraphs:
+        if len(current_chunk) + len(para) + 2 <= max_len:
+            current_chunk += (para + "\n\n")
+        else:
+            if current_chunk.strip():
+                _send_single_telegram_chunk(current_chunk.strip())
+                time.sleep(1.0)
+            # If single paragraph exceeds max_len, split by line
+            if len(para) > max_len:
+                lines = para.split("\n")
+                sub_chunk = ""
+                for line in lines:
+                    if len(sub_chunk) + len(line) + 1 <= max_len:
+                        sub_chunk += (line + "\n")
+                    else:
+                        _send_single_telegram_chunk(sub_chunk.strip())
+                        time.sleep(1.0)
+                        sub_chunk = line + "\n"
+                current_chunk = sub_chunk
+            else:
+                current_chunk = para + "\n\n"
+
+    if current_chunk.strip():
+        _send_single_telegram_chunk(current_chunk.strip())
+
+# --- 1:1 ALIGNED MATHEMATICAL ENGINES ---
+def calculate_wilder_rsi(closes, period=14):
+    n = len(closes)
+    rsi = [50.0] * n
+    if n < period + 1:
+        return rsi
+    gains, losses = [0.0] * n, [0.0] * n
+    for i in range(1, n):
+        diff = closes[i] - closes[i - 1]
+        if diff > 0:
+            gains[i] = diff
+        else:
+            losses[i] = -diff
+    avg_gain = sum(gains[1:period + 1]) / period
+    avg_loss = sum(losses[1:period + 1]) / period
+    rsi[period] = 100.0 if avg_loss == 0 else 100.0 - (100.0 / (1.0 + avg_gain / avg_loss))
+    for i in range(period + 1, n):
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        rsi_val = 100 - (100 / (1 + (avg_gain / avg_loss))) if avg_loss != 0 else 100
-        rsi_series.append(rsi_val)
-        
-    return rsi_series
+        rsi[i] = 100.0 if avg_loss == 0 else 100.0 - (100.0 / (1.0 + avg_gain / avg_loss))
+    for i in range(period):
+        rsi[i] = rsi[period]
+    return rsi
 
-def analyze_candles(symbol, interval, limit=200):
+def calculate_ema(data, period):
+    n = len(data)
+    ema = [data[0]] * n
+    k = 2.0 / (period + 1)
+    for i in range(1, n):
+        ema[i] = data[i] * k + ema[i - 1] * (1.0 - k)
+    return ema
+
+def calculate_rma(data, period):
+    """Wilder's RMA smoothing matching standard TradingView calculations."""
+    n = len(data)
+    rma = [0.0] * n
+    if n < period:
+        return rma
+    rma[period - 1] = sum(data[:period]) / period
+    for i in range(period, n):
+        rma[i] = (rma[i - 1] * (period - 1) + data[i]) / period
+    for i in range(period - 1):
+        rma[i] = rma[period - 1]
+    return rma
+
+def calculate_atr(highs, lows, closes, period=14):
+    n = len(closes)
+    tr = [0.0] * n
+    tr[0] = highs[0] - lows[0]
+    for i in range(1, n):
+        tr[i] = max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
+    return calculate_rma(tr, period)
+
+def calculate_macd(closes):
+    ema12 = calculate_ema(closes, 12)
+    ema26 = calculate_ema(closes, 26)
+    macd_line = [ema12[i] - ema26[i] for i in range(len(closes))]
+    signal_line = calculate_ema(macd_line, 9)
+    hist = [macd_line[i] - signal_line[i] for i in range(len(closes))]
+    return macd_line, signal_line, hist
+
+# --- MARKET DATA & INDEX-ANCHORED ANATOMY ---
+def fetch_candle_data(symbol, interval, limit=200):
     url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-    data = requests.get(url).json()
-    
-    if isinstance(data, dict) and 'code' in data:
-        raise Exception("Symbol not found")
-        
-    opens = [float(c[1]) for c in data]
-    highs = [float(c[2]) for c in data]
-    lows = [float(c[3]) for c in data]
-    closes = [float(c[4]) for c in data]
-    volumes = [float(v[5]) for v in data]
-    
-    current_price = closes[-1]
-    structural_low = min(lows[:-1])
-    structural_high = max(highs[:-1])
-    
-    rsi_series = calculate_rsi_series(closes)
-    current_rsi = rsi_series[-1]
-    
-    prev_high_idx = highs.index(max(highs[-40:-1])) if len(highs) > 40 else 0
-    bearish_divergence = (current_price >= highs[prev_high_idx] * 0.98) and (current_rsi < rsi_series[prev_high_idx] - 5)
-    
-    candle_range = highs[-1] - lows[-1]
-    upper_wick = highs[-1] - max(opens[-1], closes[-1])
-    wick_rejection = (upper_wick / candle_range > 0.40) if candle_range > 0 else False
-    
-    avg_vol = sum(volumes[-21:-1]) / 20 if len(volumes) >= 21 else 1
-    vol_climax = volumes[-1] > (avg_vol * 1.6)
-    
+    res = HTTP.get(url, timeout=10)
+    res.raise_for_status()
+    raw = res.json()
+
+    opens, highs, lows, closes, volumes = [], [], [], [], []
+    for c in raw:
+        opens.append(float(c[1]))
+        highs.append(float(c[2]))
+        lows.append(float(c[3]))
+        closes.append(float(c[4]))
+        volumes.append(float(c[5]))
+
+    closed_idx = len(closes) - 2
+    rsi_series = calculate_wilder_rsi(closes)
+    macd_line, sig_line, macd_hist = calculate_macd(closes)
+    ema200 = calculate_ema(closes, 200)
+    atr = calculate_atr(highs, lows, closes)
+
+    c_close, c_low, c_high = closes[closed_idx], lows[closed_idx], highs[closed_idx]
+    c_rsi, c_hist, c_atr = rsi_series[closed_idx], macd_hist[closed_idx], atr[closed_idx]
+    prev_hist = macd_hist[closed_idx - 1]
+
+    # 200-Candle Extremes
+    prior_lows, prior_highs = lows[:closed_idx], highs[:closed_idx]
+    structural_low = min(prior_lows) if prior_lows else c_low
+    structural_high = max(prior_highs) if prior_highs else c_high
+    struct_low_idx = prior_lows.index(structural_low) if prior_lows else 0
+    struct_high_idx = prior_highs.index(structural_high) if prior_highs else 0
+
+    # Confirmed Local Swing Pivots (Index, Price)
+    local_swings_low = [(i, lows[i]) for i in range(5, closed_idx - 5) if lows[i] == min(lows[i - 5:i + 6])]
+    local_swings_high = [(i, highs[i]) for i in range(5, closed_idx - 5) if highs[i] == max(highs[i - 5:i + 6])]
+    recent_swing_low_idx, recent_swing_low = local_swings_low[-1] if local_swings_low else (struct_low_idx, structural_low)
+    recent_swing_high_idx, recent_swing_high = local_swings_high[-1] if local_swings_high else (struct_high_idx, structural_high)
+
+    # Momentum Slopes & True Divergences (Index Aligned)
+    hist_slope_up = c_hist > prev_hist
+    hist_slope_down = c_hist < prev_hist
+
+    bullish_div = c_low <= recent_swing_low * 1.02 and c_rsi > rsi_series[recent_swing_low_idx]
+    macd_bullish_div = c_low <= recent_swing_low * 1.02 and c_hist > macd_hist[recent_swing_low_idx]
+
+    bearish_div = c_high >= recent_swing_high * 0.98 and c_rsi < rsi_series[recent_swing_high_idx]
+    macd_bearish_div = c_high >= recent_swing_high * 0.98 and c_hist < macd_hist[recent_swing_high_idx]
+
+    # Robust Volume Median
+    recent_vols = volumes[max(0, closed_idx - 20):closed_idx]
+    vol_median = sorted(recent_vols)[len(recent_vols) // 2] if recent_vols else 1.0
+    vol_ratio = volumes[closed_idx] / vol_median
+
+    # Wicks
+    candle_range = c_high - c_low
+    lower_wick = (min(opens[closed_idx], c_close) - c_low) / candle_range if candle_range > 0 else 0
+    upper_wick = (c_high - max(opens[closed_idx], c_close)) / candle_range if candle_range > 0 else 0
+
+    ema200_ext = ((c_close - ema200[closed_idx]) / ema200[closed_idx]) * 100
+
     return {
-        "price": current_price,
+        "price": c_close,
         "structural_low": structural_low,
         "structural_high": structural_high,
-        "rsi": current_rsi,
-        "vol_climax": vol_climax,
-        "wick_rejection": wick_rejection,
-        "bearish_divergence": bearish_divergence
+        "rsi": c_rsi,
+        "hist_slope_up": hist_slope_up,
+        "hist_slope_down": hist_slope_down,
+        "bullish_div": bullish_div,
+        "macd_bullish_div": macd_bullish_div,
+        "bearish_div": bearish_div,
+        "macd_bearish_div": macd_bearish_div,
+        "vol_ratio": vol_ratio,
+        "lower_wick": lower_wick,
+        "upper_wick": upper_wick,
+        "ema200_ext": ema200_ext,
+        "atr": c_atr
     }
 
-def get_liquidity_walls(symbol, current_price):
-    ob_url = f"https://data-api.binance.vision/api/v3/depth?symbol={symbol}&limit=100"
+# --- NOTIONAL & SIZE-AWARE LIQUIDITY ---
+def analyze_liquidity(symbol, current_price, atr):
+    url = f"https://data-api.binance.vision/api/v3/depth?symbol={symbol}&limit=100"
     try:
-        ob_data = requests.get(ob_url).json()
-        bids = ob_data.get('bids', [])
-        asks = ob_data.get('asks', [])
-        
-        total_bids = sum(float(b[1]) for b in bids) 
-        total_asks = sum(float(a[1]) for a in asks) 
-        ratio = total_bids / total_asks if total_asks > 0 else 1.0
-        
-        buy_wall_price = float(bids[0][0]) if bids else current_price
-        max_bid = 0.0
-        for b in bids:
-            if float(b[1]) > max_bid:
-                max_bid = float(b[1])
-                buy_wall_price = float(b[0])
-                
-        return ratio, buy_wall_price
-    except:
-        return 1.0, current_price
+        res = HTTP.get(url, timeout=10)
+        res.raise_for_status()
+        data = res.json()
 
+        valid_band = max(1.5 * atr, current_price * 0.02)
+        slip_band = current_price * 0.01
+
+        bids, asks = [], []
+        bid_depth_1pct, ask_depth_1pct = 0.0, 0.0
+
+        for b in data.get("bids", []):
+            p, q = float(b[0]), float(b[1])
+            if current_price - p <= valid_band:
+                n = p * q
+                bids.append({"p": p, "n": n})
+                if current_price - p <= slip_band:
+                    bid_depth_1pct += n
+
+        for a in data.get("asks", []):
+            p, q = float(a[0]), float(a[1])
+            if p - current_price <= valid_band:
+                n = p * q
+                asks.append({"p": p, "n": n})
+                if p - current_price <= slip_band:
+                    ask_depth_1pct += n
+
+        best_bid, max_bid_notional = current_price, 0.0
+        for b in bids:
+            cluster_val = sum(x["n"] for x in bids if abs(x["p"] - b["p"]) <= current_price * 0.004)
+            if cluster_val > max_bid_notional:
+                best_bid, max_bid_notional = b["p"], cluster_val
+
+        best_ask, max_ask_notional = current_price, 0.0
+        for a in asks:
+            cluster_val = sum(x["n"] for x in asks if abs(x["p"] - a["p"]) <= current_price * 0.004)
+            if cluster_val > max_ask_notional:
+                best_ask, max_ask_notional = a["p"], cluster_val
+
+        # Size & Price Persistence Check
+        prev_liq = STATE.get(symbol, {}).get("liquidity", {})
+        bid_persistent, ask_persistent = False, False
+
+        if prev_liq:
+            pb = prev_liq.get("bid", {})
+            if pb.get("price", 0) > 0:
+                if abs(best_bid - pb["price"]) < current_price * 0.005 and max_bid_notional >= (pb.get("notional", 0) * 0.5):
+                    bid_persistent = True
+            pa = prev_liq.get("ask", {})
+            if pa.get("price", 0) > 0:
+                if abs(best_ask - pa["price"]) < current_price * 0.005 and max_ask_notional >= (pa.get("notional", 0) * 0.5):
+                    ask_persistent = True
+
+        update_liquidity_state(
+            symbol,
+            {"price": best_bid, "notional": max_bid_notional},
+            {"price": best_ask, "notional": max_ask_notional}
+        )
+
+        return {
+            "bid_support": best_bid,
+            "ask_resistance": best_ask,
+            "bid_depth_1pct": bid_depth_1pct,
+            "ask_depth_1pct": ask_depth_1pct,
+            "bid_persistent": bid_persistent,
+            "ask_persistent": ask_persistent
+        }
+    except Exception as e:
+        logger.warning(f"Order book analysis failed for {symbol}: {e}")
+        return {
+            "bid_support": current_price,
+            "ask_resistance": current_price,
+            "bid_depth_1pct": 0,
+            "ask_depth_1pct": 0,
+            "bid_persistent": False,
+            "ask_persistent": False
+        }
+
+# --- CATEGORIZED CONFLUENCE ENGINE (Max 100 Points) ---
+def evaluate_signals(d4, d1, ob):
+    buy_score, exit_score = 0, 0
+    buy_factors, exit_factors = [], []
+    p = d4["price"]
+
+    # 1. STRUCTURAL CONTEXT (Max 20 Points)
+    if p - d4["structural_low"] <= 1.2 * d4["atr"]:
+        buy_score += 10
+        buy_factors.append("🏗️ Near Macro Structural Low")
+    if d4["ema200_ext"] < -15.0:
+        buy_score += 10
+        buy_factors.append(f"🏗️ Extended Below EMA200 ({d4['ema200_ext']:+.1f}%)")
+
+    if d4["structural_high"] - p <= 1.2 * d4["atr"]:
+        exit_score += 10
+        exit_factors.append("🏗️ Testing Macro Structural High")
+    if d4["ema200_ext"] > 25.0:
+        exit_score += 10
+        exit_factors.append(f"🏗️ Extended Above EMA200 ({d4['ema200_ext']:+.1f}%)")
+
+    # 2. MOMENTUM (Max 25 Points)
+    if d4["rsi"] < 32:
+        buy_score += 10
+        buy_factors.append(f"⚡ RSI Deeply Oversold ({d4['rsi']:.1f})")
+    elif d4["rsi"] < 40:
+        buy_score += 5
+        buy_factors.append(f"⚡ RSI Near Oversold ({d4['rsi']:.1f})")
+    if d4["bullish_div"]:
+        buy_score += 5
+        buy_factors.append("⚡ Confirmed RSI Bullish Divergence")
+    if d4["macd_bullish_div"]:
+        buy_score += 5
+        buy_factors.append("⚡ MACD Hist Bullish Divergence")
+    if d4["hist_slope_up"]:
+        buy_score += 5
+        buy_factors.append("⚡ MACD Downside Momentum Weakening")
+
+    if d4["rsi"] > 70:
+        exit_score += 10
+        exit_factors.append(f"⚡ RSI Exhaustion ({d4['rsi']:.1f})")
+    elif d4["rsi"] > 62:
+        exit_score += 5
+        exit_factors.append(f"⚡ RSI Elevated ({d4['rsi']:.1f})")
+    if d4["bearish_div"]:
+        exit_score += 5
+        exit_factors.append("⚡ Confirmed RSI Bearish Divergence")
+    if d4["macd_bearish_div"]:
+        exit_score += 5
+        exit_factors.append("⚡ MACD Hist Bearish Divergence")
+    if d4["hist_slope_down"]:
+        exit_score += 5
+        exit_factors.append("⚡ MACD Upside Momentum Weakening")
+
+    # 3. VOLUME & CANDLE REJECTION (Max 20 Points)
+    if d4["vol_ratio"] >= 1.6:
+        buy_score += 10
+        buy_factors.append(f"📊 Capitulation Volume ({d4['vol_ratio']:.1f}x Median)")
+        # Structural proximity check for volume blow-off
+        if d4["structural_high"] - p <= 1.5 * d4["atr"] or p >= d4["structural_high"] * 0.95:
+            exit_score += 10
+            exit_factors.append(f"📊 Blow-off/Distribution Volume ({d4['vol_ratio']:.1f}x Median)")
+
+    if d4["lower_wick"] >= 0.35:
+        buy_score += 10
+        buy_factors.append(f"📊 Lower Wick Absorption ({d4['lower_wick']*100:.0f}%)")
+    if d4["upper_wick"] >= 0.35:
+        exit_score += 10
+        exit_factors.append(f"📊 Upper Wick Rejection ({d4['upper_wick']*100:.0f}%)")
+
+    # 4. SPOOF-RESISTANT LIQUIDITY (Max 20 Points)
+    if ob["bid_depth_1pct"] > ob["ask_depth_1pct"] * 1.5:
+        buy_score += 10
+        buy_factors.append("💧 Strong Bid Depth Skew")
+    if ob["bid_persistent"]:
+        buy_score += 10
+        buy_factors.append("💧 Persistent Clustered Bid Support (Size & Price Verified)")
+
+    if ob["ask_depth_1pct"] > ob["bid_depth_1pct"] * 1.5:
+        exit_score += 10
+        exit_factors.append("💧 Strong Ask Resistance Skew")
+    if ob["ask_persistent"]:
+        exit_score += 10
+        exit_factors.append("💧 Persistent Clustered Ask Wall (Size & Price Verified)")
+
+    # 5. 1D HIGHER TIMEFRAME CONTEXT (Max 15 Points)
+    if d1["price"] - d1["structural_low"] <= 1.5 * d1["atr"]:
+        buy_score += 10
+        buy_factors.append("🌍 1D Context: Near Macro Bottom")
+    if d1["rsi"] < 40 or d1["bullish_div"]:
+        buy_score += 5
+        buy_factors.append("🌍 1D Context: RSI/Div Confluence")
+
+    if d1["structural_high"] - d1["price"] <= 1.5 * d1["atr"]:
+        exit_score += 10
+        exit_factors.append("🌍 1D Context: Near Macro Peak")
+    if d1["rsi"] > 65 or d1["bearish_div"]:
+        exit_score += 5
+        exit_factors.append("🌍 1D Context: RSI/Div Exhaustion")
+
+    # Capping and Thresholds
+    buy_score = min(buy_score, 100)
+    exit_score = min(exit_score, 100)
+
+    buy_sig = "CONFIRMED_BUY" if buy_score >= 65 and (d4["hist_slope_up"] or d4["bullish_div"] or d4["macd_bullish_div"] or d4["lower_wick"] >= 0.35) else ("EARLY_ACCUM" if buy_score >= 45 else None)
+    exit_sig = "CONFIRMED_EXIT" if exit_score >= 65 and (d4["hist_slope_down"] or d4["bearish_div"] or d4["macd_bearish_div"] or d4["upper_wick"] >= 0.35) else ("APPROACHING_TOP" if exit_score >= 45 else None)
+
+    return buy_sig, buy_score, buy_factors, exit_sig, exit_score, exit_factors
+
+# --- DYNAMIC MOVER DISCOVERY WITH CLEAN ERROR LOGGING ---
+def get_dynamic_movers(top_n=3):
+    url = "https://data-api.binance.vision/api/v3/ticker/24hr"
+    try:
+        res = HTTP.get(url, timeout=10)
+        res.raise_for_status()
+        tickers = res.json()
+        if not isinstance(tickers, list):
+            logger.error(f"Unexpected ticker format returned: {type(tickers)}")
+            return [], []
+            
+        l1s = sorted([t for t in tickers if t.get("symbol") in L1_L2_UNIVERSE and t.get("symbol") not in CORE_WATCHLIST], key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)
+        ais = sorted([t for t in tickers if t.get("symbol") in AI_UNIVERSE and t.get("symbol") not in CORE_WATCHLIST], key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)
+        return [t["symbol"] for t in l1s[:top_n]], [t["symbol"] for t in ais[:top_n]]
+    except requests.RequestException as e:
+        logger.error(f"Network error fetching 24h tickers: {e}")
+        return [], []
+    except (ValueError, KeyError, TypeError) as e:
+        logger.error(f"Data parsing error on 24h tickers: {e}")
+        return [], []
+
+# --- MAIN WORKFLOW CONTROLLER ---
 def check_market():
-    top_l1, top_ai = get_dynamic_market_leaders(top_n=5)
-    full_watchlist = CORE_WATCHLIST + top_l1 + top_ai
-    
-    report_1d = "🌍 *[1D MACRO CYCLE OVERVIEW - 200D STRUCTURE]* 🌍\n\n"
-    report_4h = "⚡ *[4H SWING REPORT - WITH 1D CONFLUENCE]* ⚡\n\n"
-    
-    if top_l1 or top_ai:
-        clean_l1 = [c.replace("USDT", "") for c in top_l1]
-        clean_ai = [c.replace("USDT", "") for c in top_ai]
-        report_4h += (f"🌐 *Active L1/L2 Leaders:* {', '.join(clean_l1)}\n"
-                      f"🤖 *Active AI Leaders:* {', '.join(clean_ai)}\n──────────────\n")
+    logger.info("Initializing multi-sector Spot Cycle Scanner...")
+
+    top_l1, top_ai = get_dynamic_movers(top_n=3)
+    full_watchlist = list(dict.fromkeys(CORE_WATCHLIST + top_l1 + top_ai))
 
     for symbol in full_watchlist:
         coin_name = symbol.replace("USDT", "")
-        
-        # Visual badges for Telegram reports
-        badge = "🔹"
-        if symbol in top_l1: badge = "🌐"
-        elif symbol in top_ai: badge = "🤖"
 
         try:
-            d4 = analyze_candles(symbol, "4h", limit=200)
-            d1 = analyze_candles(symbol, "1d", limit=200)
-            ratio, buy_wall = get_liquidity_walls(symbol, d4["price"])
-            
-            price = d4["price"]
-            pot_gain_4h = ((d4["structural_high"] - price) / price) * 100 if price > 0 else 0
-            pot_gain_1d = ((d1["structural_high"] - price) / price) * 100 if price > 0 else 0
+            d4 = fetch_candle_data(symbol, "4h")
+            d1 = fetch_candle_data(symbol, "1d")
+            ob = analyze_liquidity(symbol, d4["price"], d4["atr"])
 
-            # --- 1D MACRO EVALUATION ---
-            if ratio >= 2.0 and price <= (d1["structural_low"] * 1.06):
-                macro_status = "🟢 Major Cycle Accumulation Floor"
-                is_1d_bullish = True
-            elif d1["rsi"] >= 45 and ratio > 1.0:
-                macro_status = "↗️ Leaning Bullish"
-                is_1d_bullish = True
-            elif d1["rsi"] < 40 or ratio < 0.7:
-                macro_status = "↘️ Leaning Bearish"
-                is_1d_bullish = False
-            else:
-                macro_status = "⚪ Neutral Consolidation"
-                is_1d_bullish = None
+            buy_sig, buy_score, buy_factors, exit_sig, exit_score, exit_factors = evaluate_signals(d4, d1, ob)
 
-            report_1d += (f"{badge} *{coin_name}* | Price: *${price}*\n"
-                          f"• *Status:* {macro_status}\n"
-                          f"• 🛡️ *Reversal Floor:* *${buy_wall}*\n"
-                          f"• 🎯 *Macro Cycle Top (200D High):* *${d1['structural_high']}* (+{pot_gain_1d:.1f}%)\n"
-                          f"──────────────\n")
+            # Price formatting
+            p_str = format_price(d4["price"])
+            floor_str = format_price(ob["bid_support"])
+            ceil_str = format_price(ob["ask_resistance"])
 
-            # --- 4H SWING EVALUATION ---
-            is_4h_buy = (ratio >= 1.8 and price <= (d4["structural_low"] * 1.04)) or (d4["rsi"] < 35 and ratio > 1.4)
-            is_4h_exit = (price >= d4["structural_high"] * 0.97) and (
-                (d4["vol_climax"] and d4["wick_rejection"]) or 
-                d4["bearish_divergence"] or 
-                (ratio <= 0.55 and d4["rsi"] > 68)
-            )
+            # Actionable depth (consumes asks for spot buy, bids for spot exit)
+            buy_exec_depth = f"Available Asks (1% Slippage Band): ${ob['ask_depth_1pct']:,.0f}"
+            exit_exec_depth = f"Available Bids (1% Slippage Band): ${ob['bid_depth_1pct']:,.0f}"
 
-            if is_4h_buy:
-                if is_1d_bullish is True:
-                    swing_setup = "🟡 Buy Dip Setting Up"
-                    confluence = "⭐ *HIGH CONFLUENCE* (Supported by 1D)"
-                    action = f"Limit Buy near ${buy_wall}"
-                else:
-                    swing_setup = "🟡 Counter-Trend Bounce"
-                    confluence = "⚠️ *LOW CONFLUENCE* (1D weak, high trap risk)"
-                    action = "Caution. Wait for 1D stabilization."
-            elif is_4h_exit:
-                swing_setup = "🔴 Structural Rejection / Top"
-                confluence = "🎯 *CONFIRMED EXIT* (Sellers Absorbing at Highs)"
-                action = f"Secure spot profits near ${price}"
-            else:
-                swing_setup = "⚪ Range Trading"
-                confluence = "Neutral"
-                action = "No structural setup. Hold/Wait."
+            if buy_sig and not check_alert_cooldown(symbol, buy_sig, d4["price"], d4["atr"]):
+                tag = "🟢 CONFIRMED REVERSAL" if buy_sig == "CONFIRMED_BUY" else "🟡 EARLY ACCUMULATION"
+                msg = (f"{tag} : {coin_name}\n\n"
+                       f"• *Closed Price:* ${p_str} (EMA200: {d4['ema200_ext']:+.1f}%)\n"
+                       f"• *Confluence Score:* {buy_score}/100\n"
+                       f"• 🛡️ *Cluster Support:* ${floor_str}\n"
+                       f"• 💧 *Execution Depth:* {buy_exec_depth}\n\n"
+                       f"*Confluence Evidence:*\n• " + "\n• ".join(buy_factors) + "\n\n"
+                       f"📍 *Execution:* Downside accumulation detected. Assess ask liquidity for entry sizing.")
+                send_telegram(msg)
+                record_alert(symbol, buy_sig, d4["price"])
 
-            report_4h += (f"{badge} *{coin_name}* | Price: *${price}*\n"
-                          f"• *4H Setup:* {swing_setup}\n"
-                          f"• *Confluence:* {confluence}\n"
-                          f"• 🛡️ *Entry Floor:* *${buy_wall}*\n"
-                          f"• 🎯 *Target (33D High):* *${d4['structural_high']}* (+{pot_gain_4h:.1f}%)\n"
-                          f"• *Action:* {action}\n"
-                          f"──────────────\n")
+            if exit_sig and not check_alert_cooldown(symbol, exit_sig, d4["price"], d4["atr"]):
+                tag = "🔴 TRUE EXHAUSTION" if exit_sig == "CONFIRMED_EXIT" else "🟠 APPROACHING TOP"
+                msg = (f"{tag} : {coin_name}\n\n"
+                       f"• *Closed Price:* ${p_str} (EMA200: {d4['ema200_ext']:+.1f}%)\n"
+                       f"• *Confluence Score:* {exit_score}/100\n"
+                       f"• 🎯 *Cluster Resistance:* ${ceil_str}\n"
+                       f"• 💧 *Execution Depth:* {exit_exec_depth}\n\n"
+                       f"*Exhaustion Evidence:*\n• " + "\n• ".join(exit_factors) + "\n\n"
+                       f"📍 *Execution:* Peak distribution/exhaustion detected. Assess bid liquidity for exit sizing.")
+                send_telegram(msg)
+                record_alert(symbol, exit_sig, d4["price"])
 
-            # --- AUTOMATED CRITICAL ALERTS ---
-            alert_tag = ""
-            if symbol in top_l1: alert_tag = " [L1/L2 SECTOR]"
-            elif symbol in top_ai: alert_tag = " [AI SECTOR]"
+            time.sleep(1.2)
 
-            if price <= (d1["structural_low"] * 1.03) and d1["vol_climax"] and ratio >= 2.0:
-                send_alert(
-                    f"🟢 *[1D MACRO BUY{alert_tag}] : {coin_name}*\n\n"
-                    f"• *Current Price:* ${price}\n"
-                    f"• 🛡️ *Accumulation Floor:* ${buy_wall}\n"
-                    f"• 🎯 *Macro Cycle Target:* ${d1['structural_high']} (+{pot_gain_1d:.1f}%)\n\n"
-                    f"📍 *Execution:* Macro capitulation absorbed on 200-day structure. High-conviction entry."
-                )
-
-            elif is_4h_buy and d4["vol_climax"] and (is_1d_bullish is True):
-                send_alert(
-                    f"🟡 *[4H SPOT SWING BUY{alert_tag}] : {coin_name}*\n\n"
-                    f"• *Current Price:* ${price}\n"
-                    f"• 1D Confluence: ⭐ HIGH\n"
-                    f"• 🛡️ *Entry Floor:* ${buy_wall}\n"
-                    f"• 🎯 *Swing Target (33D High):* ${d4['structural_high']} (+{pot_gain_4h:.1f}%)\n\n"
-                    f"📍 *Execution:* Pullback absorbed into institutional buy wall. Place Limit Buy near *${buy_wall}*."
-                )
-
-            elif is_4h_exit:
-                reasons = []
-                if d4["bearish_divergence"]: reasons.append("Bearish RSI Divergence")
-                if d4["wick_rejection"]: reasons.append("Upper Wick Rejection")
-                if ratio <= 0.55: reasons.append("Heavy Sell Walls")
-                
-                send_alert(
-                    f"🔴 *[4H SWING EXIT / TAKE PROFIT{alert_tag}] : {coin_name}*\n\n"
-                    f"• *Exit Price:* ${price}\n"
-                    f"• *Range High Tested:* ${d4['structural_high']}\n"
-                    f"• *Exhaustion Signals:* {', '.join(reasons)}\n\n"
-                    f"📍 *Execution:* Structural high reached with active seller absorption. Lock in spot profits!"
-                )
-
-            time.sleep(1.5)
-            
-        except Exception:
-            report_1d += f"{badge} *{coin_name}* | ⚠️ Data unavailable\n──────────────\n"
-            report_4h += f"{badge} *{coin_name}* | ⚠️ Data unavailable\n──────────────\n"
-            continue 
-
-    if RUN_MODE != 'schedule':
-        send_alert(report_1d)
-        time.sleep(2)
-        send_alert(report_4h)
+        except Exception as e:
+            logger.error(f"Failed analysis for {symbol}: {e}")
+            continue
 
 if __name__ == "__main__":
     check_market()
