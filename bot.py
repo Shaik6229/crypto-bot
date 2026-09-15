@@ -4,6 +4,8 @@ import time
 
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('CHAT_ID')
+# Detects if you clicked "Run Workflow" (manual) or if it's the 2-hour timer (schedule)
+RUN_MODE = os.environ.get('GITHUB_EVENT_NAME', 'workflow_dispatch') 
 
 WATCHLIST = [
     "SOLUSDT", "XRPUSDT", "ADAUSDT", "SUIUSDT", "LINKUSDT", 
@@ -18,80 +20,77 @@ def send_alert(msg):
 def analyze_timeframe(symbol, interval):
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit=21"
     klines = requests.get(url).json()
-    
     closes = [float(c[4]) for c in klines]
     volumes = [float(v[5]) for v in klines]
     
-    gains = [max(0, closes[i] - closes[i-1]) for i in range(1, len(closes))]
-    losses = [max(0, closes[i-1] - closes[i]) for i in range(1, len(closes))]
-    avg_gain = sum(gains[-14:]) / 14 if len(gains) >= 14 else 0
-    avg_loss = sum(losses[-14:]) / 14 if len(losses) >= 14 else 0
-    rsi = 100 - (100 / (1 + (avg_gain / avg_loss))) if avg_loss != 0 else 50
+    # Calculate Institutional Trap Zones (20-period highs and lows)
+    lows = [float(c[3]) for c in klines[:-1]]
+    highs = [float(c[2]) for c in klines[:-1]]
+    recent_low = min(lows)
+    recent_high = max(highs)
     
     avg_vol = sum(volumes[:-1]) / len(volumes[:-1]) if len(volumes) > 1 else 1
     vol_climax = volumes[-1] > (avg_vol * 1.5)
     
-    return rsi, vol_climax, closes[-1]
+    return vol_climax, closes[-1], recent_low, recent_high
 
 def get_spot_liquidity(symbol):
-    # Only fetches pure Spot market L2 order book data
     ob_url = f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit=100"
     ob_data = requests.get(ob_url).json()
-    
-    bids = sum(float(b[1]) for b in ob_data['bids']) # Total resting Spot Buy limits
-    asks = sum(float(a[1]) for a in ob_data['asks']) # Total resting Spot Sell limits
+    bids = sum(float(b[1]) for b in ob_data['bids']) 
+    asks = sum(float(a[1]) for a in ob_data['asks']) 
     ratio = bids / asks if asks > 0 else 1.0
-    
     return ratio, bids, asks
 
 def check_market():
+    report = "📊 *LIVE MARKET DIAGNOSTIC* 📊\n_Institutional Order Flow Predictions_\n\n"
+    
     for symbol in WATCHLIST:
         try:
-            rsi_4h, vol_4h, price = analyze_timeframe(symbol, "4h")
-            rsi_1d, vol_1d, _ = analyze_timeframe(symbol, "1d")
-            
+            vol_4h, price, low_4h, high_4h = analyze_timeframe(symbol, "4h")
+            vol_1d, _, low_1d, high_1d = analyze_timeframe(symbol, "1d")
             ratio, bids, asks = get_spot_liquidity(symbol)
             
-            # --- 1D MACRO CYCLE ALERTS ---
-            if rsi_1d < 35 and vol_1d and ratio >= 2.0:
-                msg = (f"🟢 *[1D SPOT BUY] Macro Bottom : {symbol}*\n\n"
-                       f"Massive Spot Limit Buy walls are absorbing panic selling. Strong entry zone.\n\n"
-                       f"• *Current Price:* ${price}\n"
-                       f"• *Buy/Sell Wall Ratio:* {ratio:.2f}x\n"
-                       f"• *Resting Buy Orders:* {bids:.0f} coins\n"
-                       f"• *Volume Climax:* ✅ Confirmed")
-                send_alert(msg)
+            # --- 1. PREDICTIVE AI LOGIC (For Manual Reports) ---
+            if ratio >= 2.0 and price <= (low_1d * 1.05):
+                prediction = "🟢 *High Probability UP* (Whale Absorption at Support)"
+            elif ratio <= 0.5 and price >= (high_1d * 0.95):
+                prediction = "🔴 *High Probability DOWN* (Whale Distribution at Resistance)"
+            elif ratio > 1.3:
+                prediction = "↗️ *Leaning Bullish* (Bids outweighing Asks)"
+            elif ratio < 0.7:
+                prediction = "↘️ *Leaning Bearish* (Asks outweighing Bids)"
+            else:
+                prediction = "⚪ *Neutral Chop* (Wait for clear institutional footprint)"
                 
-            elif rsi_1d > 65 and vol_1d and ratio <= 0.5:
-                msg = (f"🔴 *[1D SPOT EXIT] Macro Top : {symbol}*\n\n"
-                       f"Massive Spot Limit Sell walls are blocking upward momentum. Book your profits here.\n\n"
-                       f"• *Current Price:* ${price}\n"
-                       f"• *Sell/Buy Wall Ratio:* {(1/ratio):.2f}x\n"
-                       f"• *Resting Sell Orders:* {asks:.0f} coins\n"
-                       f"• *Volume Climax:* ✅ Confirmed")
-                send_alert(msg)
-
-            # --- 4H TACTICAL SWING ALERTS ---
-            elif rsi_4h < 33 and vol_4h and ratio >= 2.0:
-                msg = (f"🟡 *[4H SPOT BUY] Swing Bottom : {symbol}*\n\n"
-                       f"Tactical pullback exhaustion. Limit buyers defending the 4H support zone.\n\n"
-                       f"• *Current Price:* ${price}\n"
-                       f"• *Buy/Sell Wall Ratio:* {ratio:.2f}x\n"
-                       f"• *Volume Climax:* ✅ Confirmed")
-                send_alert(msg)
+            report += (f"🔹 *{symbol}* | Price: ${price}\n"
+                       f"• *Prediction:* {prediction}\n"
+                       f"• Limit Ratio: {ratio:.2f}x\n"
+                       f"──────────────\n")
+            
+            # --- 2. AUTOMATED INSTITUTIONAL TRAP ALERTS (Strict Entry/Exit) ---
+            # BUY TRIGGER: Price is pushed to 20-day lows + Volume Spikes (Retail panic) + Massive Buy Wall absorbs it
+            if price <= (low_1d * 1.03) and vol_1d and ratio >= 2.0:
+                send_alert(f"🟢 *[1D PERFECT ENTRY] : {symbol}*\n\n"
+                           f"Market Maker Trap detected! Retail is panic selling into a massive institutional buy wall at support.\n\n"
+                           f"• *Price:* ${price}\n• *Absorption Ratio:* {ratio:.2f}x\n"
+                           f"• *Spot Bids Defending:* {bids:.0f}")
                 
-            elif rsi_4h > 67 and vol_4h and ratio <= 0.5:
-                msg = (f"🟠 *[4H SPOT EXIT] Swing Top : {symbol}*\n\n"
-                       f"Tactical rally exhaustion. Limit sellers defending resistance. Good place to secure profits.\n\n"
-                       f"• *Current Price:* ${price}\n"
-                       f"• *Sell/Buy Wall Ratio:* {(1/ratio):.2f}x\n"
-                       f"• *Volume Climax:* ✅ Confirmed")
-                send_alert(msg)
+            # SELL TRIGGER: Price is pushed to 20-day highs + Volume Spikes (Retail FOMO) + Massive Sell Wall blocks it
+            elif price >= (high_1d * 0.97) and vol_1d and ratio <= 0.5:
+                send_alert(f"🔴 *[1D PERFECT EXIT] : {symbol}*\n\n"
+                           f"Market Maker Distribution! Retail is buying the breakout, but whales are dumping via heavy limit sell walls.\n\n"
+                           f"• *Price:* ${price}\n• *Distribution Ratio:* {(1/ratio):.2f}x\n"
+                           f"• *Spot Asks Blocking:* {asks:.0f}")
 
-            time.sleep(1.5) 
+            time.sleep(1) 
             
         except Exception:
             continue 
+
+    # Only send the massive multi-coin prediction report if you ran it manually
+    if RUN_MODE != 'schedule':
+        send_alert(report)
 
 if __name__ == "__main__":
     check_market()
