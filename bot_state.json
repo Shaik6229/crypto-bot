@@ -2,27 +2,27 @@
   "SOLUSDT": {
     "liquidity": {
       "bid": {
-        "price": 96.77,
-        "notional": 2897165.5537299984
+        "price": 96.07,
+        "notional": 3451156.6429599994
       },
       "ask": {
-        "price": 97.54,
-        "notional": 3133354.56471
+        "price": 96.84,
+        "notional": 2929884.910769999
       },
-      "time": 1789522037.2871463
+      "time": 1789523707.2790635
     }
   },
   "XRPUSDT": {
     "liquidity": {
       "bid": {
-        "price": 1.2841,
-        "notional": 3603971.535940003
+        "price": 1.2709,
+        "notional": 1790026.2633899997
       },
       "ask": {
-        "price": 1.2941,
-        "notional": 642052.7667600003
+        "price": 1.2807,
+        "notional": 726756.7508300003
       },
-      "time": 1789522038.8049893
+      "time": 1789523708.8283668
     },
     "alert": {
       "signal": "EARLY_ACCUM",
@@ -33,14 +33,14 @@
   "ADAUSDT": {
     "liquidity": {
       "bid": {
-        "price": 0.1942,
-        "notional": 352940.42638
+        "price": 0.192,
+        "notional": 398559.25533
       },
       "ask": {
-        "price": 0.1958,
-        "notional": 246707.43924
+        "price": 0.1935,
+        "notional": 289978.19564
       },
-      "time": 1789522041.0873268
+      "time": 1789523710.377403
     },
     "alert": {
       "signal": "EARLY_ACCUM",
@@ -51,14 +51,14 @@
   "SUIUSDT": {
     "liquidity": {
       "bid": {
-        "price": 0.6854,
-        "notional": 347980.43194
+        "price": 0.6793,
+        "notional": 349681.43619000015
       },
       "ask": {
-        "price": 0.6913,
-        "notional": 258871.92508000004
+        "price": 0.6849,
+        "notional": 306280.27843
       },
-      "time": 1789522042.6033342
+      "time": 1789523711.9258509
     },
     "alert": {
       "signal": "EARLY_ACCUM",
@@ -69,27 +69,27 @@
   "LINKUSDT": {
     "liquidity": {
       "bid": {
-        "price": 10.863,
-        "notional": 364837.99120999995
+        "price": 10.743,
+        "notional": 335716.9560299999
       },
       "ask": {
-        "price": 10.954,
-        "notional": 367147.19563
+        "price": 10.834,
+        "notional": 263817.08256999997
       },
-      "time": 1789522044.120223
+      "time": 1789523713.4762936
     }
   },
   "XLMUSDT": {
     "liquidity": {
       "bid": {
-        "price": 0.1756,
-        "notional": 357526.4131
+        "price": 0.1733,
+        "notional": 304776.13670000003
       },
       "ask": {
-        "price": 0.1775,
-        "notional": 228056.55449999997
+        "price": 0.1749,
+        "notional": 196681.36329999997
       },
-      "time": 1789522045.63609
+      "time": 1789523715.0241065
     },
     "alert": {
       "signal": "EARLY_ACCUM",
@@ -100,14 +100,14 @@
   "ALGOUSDT": {
     "liquidity": {
       "bid": {
-        "price": 0.0882,
-        "notional": 97111.68050000002
+        "price": 0.0876,
+        "notional": 97229.0473
       },
       "ask": {
-        "price": 0.0892,
-        "notional": 67294.751
+        "price": 0.0886,
+        "notional": 82723.61290000001
       },
-      "time": 1789522047.4937031
+      "time": 1789523716.5712152
     },
     "alert": {
       "signal": "EARLY_ACCUM",
@@ -118,27 +118,27 @@
   "POLUSDT": {
     "liquidity": {
       "bid": {
-        "price": 0.09137,
-        "notional": 66063.08765100002
+        "price": 0.09106,
+        "notional": 75998.175216
       },
       "ask": {
-        "price": 0.09219,
-        "notional": 62268.982622999996
+        "price": 0.09191,
+        "notional": 69971.591835
       },
-      "time": 1789522049.0115926
+      "time": 1789523718.1207385
     }
   },
   "FETUSDT": {
     "liquidity": {
       "bid": {
-        "price": 0.1505,
-        "notional": 163761.14214000004
+        "price": 0.1466,
+        "notional": 193732.87774999999
       },
       "ask": {
-        "price": 0.1521,
-        "notional": 124476.46686000003
+        "price": 0.1502,
+        "notional": 131954.22333000004
       },
-      "time": 1789522050.5268507
+      "time": 1789523719.6679983
     }
   },
   "TONUSDT": {
@@ -151,111 +151,111 @@
         "price": 1.603,
         "notional": 0.0
       },
-      "time": 1789522052.0611477
+      "time": 1789523721.2138743
     }
   },
   "AVAXUSDT": {
     "liquidity": {
       "bid": {
-        "price": 7.234,
-        "notional": 284774.34449999995
+        "price": 7.179,
+        "notional": 318259.1950799999
       },
       "ask": {
-        "price": 7.293,
-        "notional": 303926.33108
+        "price": 7.238,
+        "notional": 257339.37390999997
       },
-      "time": 1789522053.5771363
+      "time": 1789523722.7636645
     }
   },
   "NEARUSDT": {
     "liquidity": {
       "bid": {
-        "price": 2.331,
-        "notional": 420432.84719999996
+        "price": 2.294,
+        "notional": 515662.4827
       },
       "ask": {
-        "price": 2.364,
-        "notional": 391466.2322
+        "price": 2.319,
+        "notional": 442014.9685000001
       },
-      "time": 1789522055.092419
+      "time": 1789523724.3121326
     }
   },
   "KITEUSDT": {
     "liquidity": {
       "bid": {
-        "price": 0.0984,
-        "notional": 131290.25925
+        "price": 0.0983,
+        "notional": 128075.35114000001
       },
       "ask": {
         "price": 0.1018,
-        "notional": 126829.65338
+        "notional": 127320.01971
       },
-      "time": 1789522056.6061008
+      "time": 1789523725.8589542
     }
   },
   "ARBUSDT": {
     "liquidity": {
       "bid": {
-        "price": 0.1498,
-        "notional": 152111.8238
+        "price": 0.149,
+        "notional": 168345.23472
       },
       "ask": {
-        "price": 0.1513,
-        "notional": 122208.66391
+        "price": 0.1505,
+        "notional": 121596.72080999998
       },
-      "time": 1789522058.1223667
+      "time": 1789523727.407545
     }
   },
   "HBARUSDT": {
     "liquidity": {
       "bid": {
-        "price": 0.074,
-        "notional": 274800.8664199999
+        "price": 0.07353,
+        "notional": 356540.41067
       },
       "ask": {
-        "price": 0.07526,
-        "notional": 408772.1295
+        "price": 0.07498,
+        "notional": 279121.21877000004
       },
-      "time": 1789522059.6386328
+      "time": 1789523728.9561415
     }
   },
   "INJUSDT": {
     "liquidity": {
       "bid": {
-        "price": 5.428,
-        "notional": 133786.92932999998
+        "price": 5.342,
+        "notional": 120964.48014999996
       },
       "ask": {
-        "price": 5.478,
-        "notional": 116023.57944000003
+        "price": 5.398,
+        "notional": 157463.47048000002
       },
-      "time": 1789522061.1544065
+      "time": 1789523730.5053139
     }
   },
   "TAOUSDT": {
     "liquidity": {
       "bid": {
-        "price": 214.7,
-        "notional": 345312.96651
+        "price": 215.0,
+        "notional": 420560.68919999996
       },
       "ask": {
-        "price": 218.8,
-        "notional": 208598.20837
+        "price": 217.1,
+        "notional": 214420.29651
       },
-      "time": 1789522062.67024
+      "time": 1789523732.0548232
     }
   },
   "RENDERUSDT": {
     "liquidity": {
       "bid": {
-        "price": 1.283,
-        "notional": 198350.23386999997
+        "price": 1.278,
+        "notional": 193904.91242
       },
       "ask": {
-        "price": 1.332,
-        "notional": 174717.44374999998
+        "price": 1.32,
+        "notional": 172149.33211999998
       },
-      "time": 1789522064.184917
+      "time": 1789523733.6018963
     },
     "alert": {
       "signal": "EARLY_ACCUM",
@@ -266,14 +266,14 @@
   "THETAUSDT": {
     "liquidity": {
       "bid": {
-        "price": 0.1797,
-        "notional": 24657.646220000002
+        "price": 0.1784,
+        "notional": 25094.526619999997
       },
       "ask": {
-        "price": 0.1815,
-        "notional": 20570.73206
+        "price": 0.1803,
+        "notional": 19946.01123
       },
-      "time": 1789522066.047183
+      "time": 1789523735.1481888
     }
   }
 }
