@@ -577,8 +577,8 @@ def check_market():
             wall_display = floor_str if buy_sig else (ceil_str if exit_sig else "--")
             manual_summary += f"• *{coin_name}*: ${p_str} | Status: {status} | Key Wall: ${wall_display}\n"
 
-            # Dispatch Buy Alert
-            if buy_sig and not check_alert_cooldown(symbol, buy_sig, d4["price"], d4["atr"]):
+            # Dispatch Buy Alert (bypasses cooldown if triggered manually)
+            if buy_sig and (RUN_MODE != "schedule" or not check_alert_cooldown(symbol, buy_sig, d4["price"], d4["atr"])):
                 alerts_fired += 1
                 tag = "🟢 CONFIRMED BOTTOM REVERSAL" if buy_sig == "CONFIRMED_BUY" else "🟡 EARLY BOTTOM WARNING"
                 
@@ -605,8 +605,8 @@ def check_market():
                 send_telegram(msg)
                 record_alert(symbol, buy_sig, d4["price"])
 
-            # Dispatch Exit Alert
-            if exit_sig and not check_alert_cooldown(symbol, exit_sig, d4["price"], d4["atr"]):
+            # Dispatch Exit Alert (bypasses cooldown if triggered manually)
+            if exit_sig and (RUN_MODE != "schedule" or not check_alert_cooldown(symbol, exit_sig, d4["price"], d4["atr"])):
                 alerts_fired += 1
                 tag = "🔴 CONFIRMED TOP EXHAUSTION" if exit_sig == "CONFIRMED_EXIT" else "🟠 RALLY OVERHEATING"
                 msg = (f"{tag} : {coin_name}\n\n"
