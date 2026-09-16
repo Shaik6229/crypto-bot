@@ -1,17 +1,17 @@
-name: Crypto Liquidity Bot
+name: 1D Macro Liquidity Bot
 
 on:
   schedule:
-    # Runs at 7 minutes past every 4th hour (00:07, 04:07, 08:07, 12:07, 16:07, 20:07 UTC)
-    # Bypasses top-of-the-hour queue congestion and confirms 4H candle close
-    - cron: '7 */4 * * *'
+    # Runs at 00:07 UTC daily (05:37 AM IST)
+    # Skips the midnight traffic jam and evaluates the finalized daily candle
+    - cron: '7 0 * * *'
   workflow_dispatch: # Allows manual trigger anytime
 
 permissions:
-  contents: write # Allows pushing bot_state.json back to your repo
+  contents: write # Allows pushing daily_state.json back to your repo
 
 jobs:
-  run-bot:
+  run-daily-bot:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -25,27 +25,27 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: Run 4H Bot
+      - name: Run 1D Macro Bot
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-        run: python bot.py
+        run: python daily_macro_bot.py
 
-      - name: Persist Bot State
+      - name: Persist 1D Bot State
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           
           # Only stage the state file if it exists
-          if [ -f bot_state.json ]; then
-            git add bot_state.json
+          if [ -f daily_state.json ]; then
+            git add daily_state.json
           fi
           
           # Commit and rebase-push only if changes occurred
           if ! git diff --cached --quiet; then
-            git commit -m "chore: update bot_state.json [skip ci]"
+            git commit -m "chore: update daily_state.json [skip ci]"
             git pull --rebase origin HEAD
             git push origin HEAD
           else
-            echo "No changes to 4H state file. Skipping commit."
+            echo "No changes to 1D macro state file. Skipping commit."
           fi
