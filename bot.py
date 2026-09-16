@@ -543,6 +543,9 @@ def check_market():
     top_l1, top_ai = get_dynamic_movers(top_n=3)
     full_watchlist = list(dict.fromkeys(CORE_WATCHLIST + top_l1 + top_ai))
 
+    alerts_fired = 0
+    manual_summary = "📊 *[MANUAL SCAN DIAGNOSTIC]* 📊\n_Scanner ran successfully. Current market status:_\n\n"
+
     for symbol in full_watchlist:
         coin_name = symbol.replace("USDT", "")
 
@@ -562,7 +565,15 @@ def check_market():
             buy_exec_depth = f"Available Asks (1% Slippage Band): ${ob['ask_depth_1pct']:,.0f}"
             exit_exec_depth = f"Available Bids (1% Slippage Band): ${ob['bid_depth_1pct']:,.0f}"
 
+            # Append to manual summary report
+            status = "⚪ Neutral"
+            if buy_sig: status = f"🟢 {buy_sig} ({buy_score}/100)"
+            elif exit_sig: status = f"🔴 {exit_sig} ({exit_score}/100)"
+            
+            manual_summary += (f"• *{coin_name}*: ${p_str} | Status: {status} | Floor: ${floor_str}\n")
+
             if buy_sig and not check_alert_cooldown(symbol, buy_sig, d4["price"], d4["atr"]):
+                alerts_fired += 1
                 tag = "🟢 CONFIRMED REVERSAL" if buy_sig == "CONFIRMED_BUY" else "🟡 EARLY ACCUMULATION"
                 msg = (f"{tag} : {coin_name}\n\n"
                        f"• *Closed Price:* ${p_str} (EMA200: {d4['ema200_ext']:+.1f}%)\n"
@@ -575,6 +586,7 @@ def check_market():
                 record_alert(symbol, buy_sig, d4["price"])
 
             if exit_sig and not check_alert_cooldown(symbol, exit_sig, d4["price"], d4["atr"]):
+                alerts_fired += 1
                 tag = "🔴 TRUE EXHAUSTION" if exit_sig == "CONFIRMED_EXIT" else "🟠 APPROACHING TOP"
                 msg = (f"{tag} : {coin_name}\n\n"
                        f"• *Closed Price:* ${p_str} (EMA200: {d4['ema200_ext']:+.1f}%)\n"
@@ -591,6 +603,11 @@ def check_market():
         except Exception as e:
             logger.error(f"Failed analysis for {symbol}: {e}")
             continue
+
+    # If triggered manually via GitHub button, send diagnostic summary so you know it ran
+    if RUN_MODE != "schedule":
+        manual_summary += f"\n──────────────\n✅ *Scan Complete.* {len(full_watchlist)} coins checked. {alerts_fired} active signal(s) triggered."
+        send_telegram(manual_summary)
 
 if __name__ == "__main__":
     check_market()
