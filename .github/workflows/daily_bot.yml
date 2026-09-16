@@ -1,15 +1,17 @@
-name: 1D Macro Liquidity Bot
+name: Crypto Liquidity Bot
 
 on:
   schedule:
-    - cron: '5 0 * * *' # Runs at 00:05 UTC daily
+    # Runs at 7 minutes past every 4th hour (00:07, 04:07, 08:07, 12:07, 16:07, 20:07 UTC)
+    # Bypasses top-of-the-hour queue congestion and confirms 4H candle close
+    - cron: '7 */4 * * *'
   workflow_dispatch: # Allows manual trigger anytime
 
 permissions:
-  contents: write
+  contents: write # Allows pushing bot_state.json back to your repo
 
 jobs:
-  run-daily-bot:
+  run-bot:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -23,27 +25,27 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: Run 1D Bot
+      - name: Run 4H Bot
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-        run: python daily_macro_bot.py
+        run: python bot.py
 
-      - name: Persist 1D Bot State
+      - name: Persist Bot State
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           
-          # Only add the file IF it was created by the python script
-          if [ -f daily_state.json ]; then
-            git add daily_state.json
+          # Only stage the state file if it exists
+          if [ -f bot_state.json ]; then
+            git add bot_state.json
           fi
           
-          # Commit and push if there are new changes
+          # Commit and rebase-push only if changes occurred
           if ! git diff --cached --quiet; then
-            git commit -m "chore: update daily_state.json [skip ci]"
+            git commit -m "chore: update bot_state.json [skip ci]"
             git pull --rebase origin HEAD
             git push origin HEAD
           else
-            echo "No macro alerts triggered. State file unchanged."
+            echo "No changes to 4H state file. Skipping commit."
           fi
