@@ -261,7 +261,6 @@ def fetch_candle_data(symbol, interval, limit=200):
         closes.append(float(c[4]))
         volumes.append(float(c[5]))
 
-    # Anchor to confirmed closed candle [-2]
     closed_idx = len(closes) - 2
     rsi_series = calculate_wilder_rsi(closes)
     _, _, macd_hist = calculate_macd(closes)
@@ -400,14 +399,14 @@ def evaluate_signals(d4, d1, ob):
     # 1. STRUCTURAL CONTEXT (Max 20 Points)
     if p - d4["structural_low"] <= 1.2 * d4["atr"]:
         buy_score += 10
-        buy_factors.append("Price has dropped to a major historical floor.")
+        buy_factors.append("Price has dropped to a major 4H historical floor.")
     if d4["ema200_ext"] < -15.0:
         buy_score += 10
-        buy_factors.append("Price is unusually far below its long-term average (heavy discount).")
+        buy_factors.append("Price is unusually far below its average (heavy discount).")
 
     if d4["structural_high"] - p <= 1.2 * d4["atr"]:
         exit_score += 10
-        exit_factors.append("Price has rallied into a major historical ceiling.")
+        exit_factors.append("Price has rallied into a major 4H historical ceiling.")
     if d4["ema200_ext"] > 25.0:
         exit_score += 10
         exit_factors.append("Price is stretched far above its normal average (overheated).")
@@ -415,50 +414,50 @@ def evaluate_signals(d4, d1, ob):
     # 2. MOMENTUM (Max 25 Points)
     if d4["rsi"] < 32:
         buy_score += 10
-        buy_factors.append("Sellers are completely exhausted (Deeply Oversold).")
+        buy_factors.append("4H sellers are completely exhausted (Deeply Oversold).")
     elif d4["rsi"] < 40:
         buy_score += 5
-        buy_factors.append("Selling pressure is fading.")
+        buy_factors.append("4H selling pressure is fading.")
     if d4["bullish_div"]:
         buy_score += 5
-        buy_factors.append("Buying momentum is shifting upward despite the price dropping.")
+        buy_factors.append("4H buying momentum is shifting upward despite price dropping.")
     if d4["macd_bullish_div"]:
         buy_score += 5
-        buy_factors.append("Downside pressure is dying out.")
+        buy_factors.append("4H MACD shows downside pressure is dying out.")
     if d4["hist_slope_up"]:
         buy_score += 5
-        buy_factors.append("The speed of the price drop is slowing down.")
+        buy_factors.append("The speed of the 4H drop is slowing down.")
 
     if d4["rsi"] > 70:
         exit_score += 10
-        exit_factors.append("Buyers are completely exhausted (Overbought).")
+        exit_factors.append("4H buyers are completely exhausted (Overbought).")
     elif d4["rsi"] > 62:
         exit_score += 5
-        exit_factors.append("The rally is starting to look overheated.")
+        exit_factors.append("The 4H rally is starting to look overheated.")
     if d4["bearish_div"]:
         exit_score += 5
-        exit_factors.append("Price pushed higher, but buying strength is fading.")
+        exit_factors.append("4H price pushed higher, but buying strength is fading.")
     if d4["macd_bearish_div"]:
         exit_score += 5
-        exit_factors.append("Upward momentum is running out of steam.")
+        exit_factors.append("4H upward momentum is running out of steam.")
     if d4["hist_slope_down"]:
         exit_score += 5
-        exit_factors.append("The speed of the rally is slowing down.")
+        exit_factors.append("The speed of the 4H rally is slowing down.")
 
     # 3. VOLUME & REJECTION (Max 20 Points)
     if d4["vol_ratio"] >= 1.6:
         buy_score += 10
-        buy_factors.append("Massive panic selling occurred, but buyers absorbed it.")
+        buy_factors.append("Massive 4H panic selling occurred, but buyers absorbed it.")
         if d4["structural_high"] - p <= 1.5 * d4["atr"] or p >= d4["structural_high"] * 0.95:
             exit_score += 10
             exit_factors.append("Massive volume spike at the top (heavy distribution).")
 
     if d4["lower_wick"] >= 0.35:
         buy_score += 10
-        buy_factors.append("Price dipped hard, but buyers immediately forced it back up.")
+        buy_factors.append("4H price dipped hard, but buyers immediately forced it back up.")
     if d4["upper_wick"] >= 0.35:
         exit_score += 10
-        exit_factors.append("Price tried to push higher, but sellers aggressively rejected it.")
+        exit_factors.append("4H price tried to push higher, but sellers aggressively rejected it.")
 
     # 4. SPOOF-RESISTANT LIQUIDITY (Max 20 Points)
     if ob["bid_depth_1pct"] > ob["ask_depth_1pct"] * 1.5:
@@ -539,6 +538,27 @@ def check_market():
             floor_str = format_price(ob["bid_support"])
             ceil_str = format_price(ob["ask_resistance"])
 
+            # 1D Macro Context Block (Included in Every Alert)
+            d1_trend = "Bearish / Downtrend" if d1["ema200_ext"] < 0 else "Bullish / Uptrend"
+            if d1["price"] - d1["structural_low"] <= 1.5 * d1["atr"]:
+                d1_state = "At Major Cycle Floor (Strong Support)"
+            elif d1["structural_high"] - d1["price"] <= 1.5 * d1["atr"]:
+                d1_state = "At Major Cycle Peak (Strong Resistance)"
+            elif d1["rsi"] < 35:
+                d1_state = "Daily RSI Oversold (Selling Exhausted)"
+            elif d1["rsi"] > 65:
+                d1_state = "Daily RSI Overbought (Rally Overheated)"
+            else:
+                d1_state = f"{d1_trend} (Consolidating Mid-Range)"
+
+            d1_floor_str = format_price(d1["structural_low"])
+            d1_peak_str = format_price(d1["structural_high"])
+
+            d1_info_str = (
+                f"• 🌍 *1D Macro Context:* {d1_state}\n"
+                f"  └─ 1D RSI: *{d1['rsi']:.1f}* | 200D Cycle Floor: *${d1_floor_str}* | 200D Peak: *${d1_peak_str}*"
+            )
+
             # Human-readable execution sizing
             buy_depth_str = f"Safe Instant Buy Size: Up to ${ob['ask_depth_1pct']:,.0f} before price moves 1%"
             exit_depth_str = f"Safe Instant Sell Size: Up to ${ob['bid_depth_1pct']:,.0f} before price drops 1%"
@@ -561,12 +581,27 @@ def check_market():
             if buy_sig and not check_alert_cooldown(symbol, buy_sig, d4["price"], d4["atr"]):
                 alerts_fired += 1
                 tag = "🟢 CONFIRMED BOTTOM REVERSAL" if buy_sig == "CONFIRMED_BUY" else "🟡 EARLY BOTTOM WARNING"
+                
+                # Context-aware guidance based on 1D trend
+                if "Bearish" in d1_trend and buy_sig == "EARLY_ACCUM":
+                    exec_note = (
+                        f"Big money is stepping in on 4H. However, the daily chart is still in a downtrend. "
+                        f"Keep allocation small (25-30%) and place a Spot Limit Buy near support at **${floor_str}**. "
+                        f"If broken, be prepared for price to retest the 200D cycle floor at **${d1_floor_str}**."
+                    )
+                else:
+                    exec_note = (
+                        f"Solid accumulation detected. Do NOT market buy. "
+                        f"Consider placing a Spot Limit Buy near support at **${floor_str}**."
+                    )
+
                 msg = (f"{tag} : {coin_name}\n\n"
                        f"• *Current Price:* ${p_str}\n"
                        f"• 🛡️ *Whale Buy Wall (Support):* ${floor_str}\n"
-                       f"• 💧 *{buy_depth_str}*\n\n"
+                       f"• 💧 *{buy_depth_str}*\n"
+                       f"{d1_info_str}\n\n"
                        f"*Why the bot flagged this:*\n• " + "\n• ".join(buy_factors) + "\n\n"
-                       f"📍 *What to do:* Big money is stepping in. Do NOT market buy. Consider placing a Spot Limit Buy near the support wall at **${floor_str}**.")
+                       f"📍 *What to do:* {exec_note}")
                 send_telegram(msg)
                 record_alert(symbol, buy_sig, d4["price"])
 
@@ -577,7 +612,8 @@ def check_market():
                 msg = (f"{tag} : {coin_name}\n\n"
                        f"• *Current Price:* ${p_str}\n"
                        f"• 🎯 *Whale Sell Wall (Resistance):* ${ceil_str}\n"
-                       f"• 💧 *{exit_depth_str}*\n\n"
+                       f"• 💧 *{exit_depth_str}*\n"
+                       f"{d1_info_str}\n\n"
                        f"*Why the bot flagged this:*\n• " + "\n• ".join(exit_factors) + "\n\n"
                        f"📍 *What to do:* The rally is running out of steam. Consider taking spot profits into USDT near current prices. Do not chase or buy here.")
                 send_telegram(msg)
