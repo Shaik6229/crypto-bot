@@ -16,7 +16,7 @@ CHAT_ID = os.environ.get("CHAT_ID")
 RUN_MODE = os.environ.get("GITHUB_EVENT_NAME", "workflow_dispatch")
 STATE_FILE = "bot_state.json"
 
-# --- VETTED ASSET UNIVERSES (Top-Ranked, Shariah-Audited, No Riba/Memes) ---
+# --- VETTED ASSET UNIVERSES (Shariah-Audited, Spot-Only, No Riba/Memes) ---
 CORE_WATCHLIST = [
     "SOLUSDT", "XRPUSDT", "ADAUSDT", "SUIUSDT", "LINKUSDT",
     "XLMUSDT", "ALGOUSDT", "POLUSDT", "FETUSDT", "TONUSDT",
@@ -30,14 +30,14 @@ L1_L2_UNIVERSE = [
     "EGLDUSDT", "FLOWUSDT", "STXUSDT", "ROSEUSDT", "CELOUSDT"
 ]
 
-# Vetted Decentralized AI / Compute Infrastructure (ROSE removed to avoid overlap)
+# Vetted Decentralized AI / Compute Infrastructure (ROSE removed to prevent overlap)
 AI_UNIVERSE = [
     "TAOUSDT", "RENDERUSDT", "GRTUSDT", "THETAUSDT", "AKTUSDT",
     "ARKMUSDT", "GLMUSDT", "RLCUSDT", "IOUSDT", "JASMYUSDT",
     "IQUSDT", "NMRUSDT", "PHBUSDT", "TRACUSDT", "PHAUSDT"
 ]
 
-# --- RESILIENT HTTP SESSION ---
+# --- RESILIENT HTTP SESSION WITH RETRIES ---
 def get_http_session():
     session = requests.Session()
     retries = Retry(total=4, backoff_factor=1.5, status_forcelist=[429, 500, 502, 503, 504])
@@ -48,9 +48,8 @@ def get_http_session():
 
 HTTP = get_http_session()
 
-# --- FORMATTING HELPER ---
+# --- DYNAMIC PRICE FORMATTER ---
 def format_price(val):
-    """Formats prices dynamically so low-priced assets retain precision without visual clutter."""
     if val is None or val == 0:
         return "0.00"
     abs_val = abs(val)
@@ -65,14 +64,14 @@ def format_price(val):
     else:
         return f"{val:.8f}"
 
-# --- STATE PERSISTENCE (Alert Deduplication & Size-Aware Liquidity) ---
+# --- STATE PERSISTENCE (Alert Deduplication & Liquidity Memory) ---
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r") as f:
                 return json.load(f)
         except Exception as e:
-            logger.warning(f"State file load error: {e}")
+            logger.warning(f"Could not load state file: {e}")
     return {}
 
 def save_state(state):
@@ -80,11 +79,12 @@ def save_state(state):
         with open(STATE_FILE, "w") as f:
             json.dump(state, f, indent=2)
     except Exception as e:
-        logger.warning(f"State file save error: {e}")
+        logger.warning(f"Could not save state file: {e}")
 
 STATE = load_state()
 
 def check_alert_cooldown(symbol, signal_type, current_price, atr):
+    """Suppresses duplicate alerts for 12 hours unless price moves > 2 ATR or signal flips."""
     last_record = STATE.get(symbol, {}).get("alert", {})
     if not last_record:
         return False
@@ -112,7 +112,7 @@ def update_liquidity_state(symbol, bid_cluster, ask_cluster):
     }
     save_state(STATE)
 
-# --- TELEGRAM BROADCASTER WITH RETRIES, 429 HANDLING & SAFE CHUNKING ---
+# --- TELEGRAM BROADCASTER (Safe Chunking, Rate Limiting & Fallback) ---
 def _send_single_telegram_chunk(text):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         return
@@ -129,26 +129,25 @@ def _send_single_telegram_chunk(text):
                     retry_after = res.json().get("parameters", {}).get("retry_after", 3)
                 except Exception:
                     pass
-                logger.warning(f"Telegram 429 rate limit hit. Sleeping {retry_after}s...")
+                logger.warning(f"Telegram rate limited. Waiting {retry_after}s...")
                 time.sleep(retry_after)
                 continue
                 
-            # If Markdown parsing failed (400), resend as plain text fallback
+            # Handle Markdown entity error fallback
             if res.status_code == 400 and "can't parse entities" in res.text.lower():
-                logger.warning("Telegram entity parsing failed. Retrying in plain text...")
+                logger.warning("Markdown formatting rejected. Retrying as plain text...")
                 HTTP.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=12)
                 return
 
             res.raise_for_status()
             return
         except requests.RequestException as e:
-            logger.warning(f"Telegram dispatch attempt {attempt} failed: {e}")
+            logger.warning(f"Telegram delivery attempt {attempt} failed: {e}")
             time.sleep(1.5 * attempt)
             
-    logger.error("Failed to deliver Telegram alert after 3 attempts.")
+    logger.error("Failed to deliver Telegram message after 3 attempts.")
 
 def send_telegram(msg):
-    """Splits oversized messages cleanly along paragraph/line breaks to avoid truncated alerts."""
     if not msg:
         return
 
@@ -157,7 +156,6 @@ def send_telegram(msg):
         _send_single_telegram_chunk(msg)
         return
 
-    # Split into clean paragraphs
     paragraphs = msg.split("\n\n")
     current_chunk = ""
     
@@ -168,7 +166,6 @@ def send_telegram(msg):
             if current_chunk.strip():
                 _send_single_telegram_chunk(current_chunk.strip())
                 time.sleep(1.0)
-            # If single paragraph exceeds max_len, split by line
             if len(para) > max_len:
                 lines = para.split("\n")
                 sub_chunk = ""
@@ -186,7 +183,7 @@ def send_telegram(msg):
     if current_chunk.strip():
         _send_single_telegram_chunk(current_chunk.strip())
 
-# --- 1:1 ALIGNED MATHEMATICAL ENGINES ---
+# --- MATHEMATICAL ENGINES (1:1 Aligned, Closed-Candle Anchored) ---
 def calculate_wilder_rsi(closes, period=14):
     n = len(closes)
     rsi = [50.0] * n
@@ -199,13 +196,16 @@ def calculate_wilder_rsi(closes, period=14):
             gains[i] = diff
         else:
             losses[i] = -diff
+
     avg_gain = sum(gains[1:period + 1]) / period
     avg_loss = sum(losses[1:period + 1]) / period
     rsi[period] = 100.0 if avg_loss == 0 else 100.0 - (100.0 / (1.0 + avg_gain / avg_loss))
+
     for i in range(period + 1, n):
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
         rsi[i] = 100.0 if avg_loss == 0 else 100.0 - (100.0 / (1.0 + avg_gain / avg_loss))
+
     for i in range(period):
         rsi[i] = rsi[period]
     return rsi
@@ -219,7 +219,6 @@ def calculate_ema(data, period):
     return ema
 
 def calculate_rma(data, period):
-    """Wilder's RMA smoothing matching standard TradingView calculations."""
     n = len(data)
     rma = [0.0] * n
     if n < period:
@@ -247,7 +246,7 @@ def calculate_macd(closes):
     hist = [macd_line[i] - signal_line[i] for i in range(len(closes))]
     return macd_line, signal_line, hist
 
-# --- MARKET DATA & INDEX-ANCHORED ANATOMY ---
+# --- MARKET DATA & PIVOT RETRIEVAL ---
 def fetch_candle_data(symbol, interval, limit=200):
     url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
     res = HTTP.get(url, timeout=10)
@@ -262,9 +261,10 @@ def fetch_candle_data(symbol, interval, limit=200):
         closes.append(float(c[4]))
         volumes.append(float(c[5]))
 
+    # Anchor to confirmed closed candle [-2]
     closed_idx = len(closes) - 2
     rsi_series = calculate_wilder_rsi(closes)
-    macd_line, sig_line, macd_hist = calculate_macd(closes)
+    _, _, macd_hist = calculate_macd(closes)
     ema200 = calculate_ema(closes, 200)
     atr = calculate_atr(highs, lows, closes)
 
@@ -272,35 +272,21 @@ def fetch_candle_data(symbol, interval, limit=200):
     c_rsi, c_hist, c_atr = rsi_series[closed_idx], macd_hist[closed_idx], atr[closed_idx]
     prev_hist = macd_hist[closed_idx - 1]
 
-    # 200-Candle Extremes
     prior_lows, prior_highs = lows[:closed_idx], highs[:closed_idx]
     structural_low = min(prior_lows) if prior_lows else c_low
     structural_high = max(prior_highs) if prior_highs else c_high
     struct_low_idx = prior_lows.index(structural_low) if prior_lows else 0
     struct_high_idx = prior_highs.index(structural_high) if prior_highs else 0
 
-    # Confirmed Local Swing Pivots (Index, Price)
     local_swings_low = [(i, lows[i]) for i in range(5, closed_idx - 5) if lows[i] == min(lows[i - 5:i + 6])]
     local_swings_high = [(i, highs[i]) for i in range(5, closed_idx - 5) if highs[i] == max(highs[i - 5:i + 6])]
     recent_swing_low_idx, recent_swing_low = local_swings_low[-1] if local_swings_low else (struct_low_idx, structural_low)
     recent_swing_high_idx, recent_swing_high = local_swings_high[-1] if local_swings_high else (struct_high_idx, structural_high)
 
-    # Momentum Slopes & True Divergences (Index Aligned)
-    hist_slope_up = c_hist > prev_hist
-    hist_slope_down = c_hist < prev_hist
-
-    bullish_div = c_low <= recent_swing_low * 1.02 and c_rsi > rsi_series[recent_swing_low_idx]
-    macd_bullish_div = c_low <= recent_swing_low * 1.02 and c_hist > macd_hist[recent_swing_low_idx]
-
-    bearish_div = c_high >= recent_swing_high * 0.98 and c_rsi < rsi_series[recent_swing_high_idx]
-    macd_bearish_div = c_high >= recent_swing_high * 0.98 and c_hist < macd_hist[recent_swing_high_idx]
-
-    # Robust Volume Median
     recent_vols = volumes[max(0, closed_idx - 20):closed_idx]
     vol_median = sorted(recent_vols)[len(recent_vols) // 2] if recent_vols else 1.0
     vol_ratio = volumes[closed_idx] / vol_median
 
-    # Wicks
     candle_range = c_high - c_low
     lower_wick = (min(opens[closed_idx], c_close) - c_low) / candle_range if candle_range > 0 else 0
     upper_wick = (c_high - max(opens[closed_idx], c_close)) / candle_range if candle_range > 0 else 0
@@ -312,12 +298,12 @@ def fetch_candle_data(symbol, interval, limit=200):
         "structural_low": structural_low,
         "structural_high": structural_high,
         "rsi": c_rsi,
-        "hist_slope_up": hist_slope_up,
-        "hist_slope_down": hist_slope_down,
-        "bullish_div": bullish_div,
-        "macd_bullish_div": macd_bullish_div,
-        "bearish_div": bearish_div,
-        "macd_bearish_div": macd_bearish_div,
+        "hist_slope_up": c_hist > prev_hist,
+        "hist_slope_down": c_hist < prev_hist,
+        "bullish_div": c_low <= recent_swing_low * 1.02 and c_rsi > rsi_series[recent_swing_low_idx],
+        "macd_bullish_div": c_low <= recent_swing_low * 1.02 and c_hist > macd_hist[recent_swing_low_idx],
+        "bearish_div": c_high >= recent_swing_high * 0.98 and c_rsi < rsi_series[recent_swing_high_idx],
+        "macd_bearish_div": c_high >= recent_swing_high * 0.98 and c_hist < macd_hist[recent_swing_high_idx],
         "vol_ratio": vol_ratio,
         "lower_wick": lower_wick,
         "upper_wick": upper_wick,
@@ -325,7 +311,7 @@ def fetch_candle_data(symbol, interval, limit=200):
         "atr": c_atr
     }
 
-# --- NOTIONAL & SIZE-AWARE LIQUIDITY ---
+# --- NOTIONAL & SIZE-AWARE LIQUIDITY ANALYSIS ---
 def analyze_liquidity(symbol, current_price, atr):
     url = f"https://data-api.binance.vision/api/v3/depth?symbol={symbol}&limit=100"
     try:
@@ -367,7 +353,6 @@ def analyze_liquidity(symbol, current_price, atr):
             if cluster_val > max_ask_notional:
                 best_ask, max_ask_notional = a["p"], cluster_val
 
-        # Size & Price Persistence Check
         prev_liq = STATE.get(symbol, {}).get("liquidity", {})
         bid_persistent, ask_persistent = False, False
 
@@ -406,7 +391,7 @@ def analyze_liquidity(symbol, current_price, atr):
             "ask_persistent": False
         }
 
-# --- CATEGORIZED CONFLUENCE ENGINE (Max 100 Points) ---
+# --- PLAIN-ENGLISH CONFLUENCE ENGINE ---
 def evaluate_signals(d4, d1, ob):
     buy_score, exit_score = 0, 0
     buy_factors, exit_factors = [], []
@@ -415,107 +400,105 @@ def evaluate_signals(d4, d1, ob):
     # 1. STRUCTURAL CONTEXT (Max 20 Points)
     if p - d4["structural_low"] <= 1.2 * d4["atr"]:
         buy_score += 10
-        buy_factors.append("🏗️ Near Macro Structural Low")
+        buy_factors.append("Price has dropped to a major historical floor.")
     if d4["ema200_ext"] < -15.0:
         buy_score += 10
-        buy_factors.append(f"🏗️ Extended Below EMA200 ({d4['ema200_ext']:+.1f}%)")
+        buy_factors.append("Price is unusually far below its long-term average (heavy discount).")
 
     if d4["structural_high"] - p <= 1.2 * d4["atr"]:
         exit_score += 10
-        exit_factors.append("🏗️ Testing Macro Structural High")
+        exit_factors.append("Price has rallied into a major historical ceiling.")
     if d4["ema200_ext"] > 25.0:
         exit_score += 10
-        exit_factors.append(f"🏗️ Extended Above EMA200 ({d4['ema200_ext']:+.1f}%)")
+        exit_factors.append("Price is stretched far above its normal average (overheated).")
 
     # 2. MOMENTUM (Max 25 Points)
     if d4["rsi"] < 32:
         buy_score += 10
-        buy_factors.append(f"⚡ RSI Deeply Oversold ({d4['rsi']:.1f})")
+        buy_factors.append("Sellers are completely exhausted (Deeply Oversold).")
     elif d4["rsi"] < 40:
         buy_score += 5
-        buy_factors.append(f"⚡ RSI Near Oversold ({d4['rsi']:.1f})")
+        buy_factors.append("Selling pressure is fading.")
     if d4["bullish_div"]:
         buy_score += 5
-        buy_factors.append("⚡ Confirmed RSI Bullish Divergence")
+        buy_factors.append("Buying momentum is shifting upward despite the price dropping.")
     if d4["macd_bullish_div"]:
         buy_score += 5
-        buy_factors.append("⚡ MACD Hist Bullish Divergence")
+        buy_factors.append("Downside pressure is dying out.")
     if d4["hist_slope_up"]:
         buy_score += 5
-        buy_factors.append("⚡ MACD Downside Momentum Weakening")
+        buy_factors.append("The speed of the price drop is slowing down.")
 
     if d4["rsi"] > 70:
         exit_score += 10
-        exit_factors.append(f"⚡ RSI Exhaustion ({d4['rsi']:.1f})")
+        exit_factors.append("Buyers are completely exhausted (Overbought).")
     elif d4["rsi"] > 62:
         exit_score += 5
-        exit_factors.append(f"⚡ RSI Elevated ({d4['rsi']:.1f})")
+        exit_factors.append("The rally is starting to look overheated.")
     if d4["bearish_div"]:
         exit_score += 5
-        exit_factors.append("⚡ Confirmed RSI Bearish Divergence")
+        exit_factors.append("Price pushed higher, but buying strength is fading.")
     if d4["macd_bearish_div"]:
         exit_score += 5
-        exit_factors.append("⚡ MACD Hist Bearish Divergence")
+        exit_factors.append("Upward momentum is running out of steam.")
     if d4["hist_slope_down"]:
         exit_score += 5
-        exit_factors.append("⚡ MACD Upside Momentum Weakening")
+        exit_factors.append("The speed of the rally is slowing down.")
 
-    # 3. VOLUME & CANDLE REJECTION (Max 20 Points)
+    # 3. VOLUME & REJECTION (Max 20 Points)
     if d4["vol_ratio"] >= 1.6:
         buy_score += 10
-        buy_factors.append(f"📊 Capitulation Volume ({d4['vol_ratio']:.1f}x Median)")
-        # Structural proximity check for volume blow-off
+        buy_factors.append("Massive panic selling occurred, but buyers absorbed it.")
         if d4["structural_high"] - p <= 1.5 * d4["atr"] or p >= d4["structural_high"] * 0.95:
             exit_score += 10
-            exit_factors.append(f"📊 Blow-off/Distribution Volume ({d4['vol_ratio']:.1f}x Median)")
+            exit_factors.append("Massive volume spike at the top (heavy distribution).")
 
     if d4["lower_wick"] >= 0.35:
         buy_score += 10
-        buy_factors.append(f"📊 Lower Wick Absorption ({d4['lower_wick']*100:.0f}%)")
+        buy_factors.append("Price dipped hard, but buyers immediately forced it back up.")
     if d4["upper_wick"] >= 0.35:
         exit_score += 10
-        exit_factors.append(f"📊 Upper Wick Rejection ({d4['upper_wick']*100:.0f}%)")
+        exit_factors.append("Price tried to push higher, but sellers aggressively rejected it.")
 
     # 4. SPOOF-RESISTANT LIQUIDITY (Max 20 Points)
     if ob["bid_depth_1pct"] > ob["ask_depth_1pct"] * 1.5:
         buy_score += 10
-        buy_factors.append("💧 Strong Bid Depth Skew")
+        buy_factors.append("The order book has significantly more buyers than sellers right now.")
     if ob["bid_persistent"]:
         buy_score += 10
-        buy_factors.append("💧 Persistent Clustered Bid Support (Size & Price Verified)")
+        buy_factors.append("A massive, verified 'Buy Wall' has been sitting patiently without moving.")
 
     if ob["ask_depth_1pct"] > ob["bid_depth_1pct"] * 1.5:
         exit_score += 10
-        exit_factors.append("💧 Strong Ask Resistance Skew")
+        exit_factors.append("The order book has significantly more sellers than buyers right now.")
     if ob["ask_persistent"]:
         exit_score += 10
-        exit_factors.append("💧 Persistent Clustered Ask Wall (Size & Price Verified)")
+        exit_factors.append("A massive, verified 'Sell Wall' is blocking the price from going higher.")
 
-    # 5. 1D HIGHER TIMEFRAME CONTEXT (Max 15 Points)
+    # 5. 1D MACRO CONTEXT (Max 15 Points)
     if d1["price"] - d1["structural_low"] <= 1.5 * d1["atr"]:
         buy_score += 10
-        buy_factors.append("🌍 1D Context: Near Macro Bottom")
+        buy_factors.append("The daily chart confirms we are near a major cycle bottom.")
     if d1["rsi"] < 40 or d1["bullish_div"]:
         buy_score += 5
-        buy_factors.append("🌍 1D Context: RSI/Div Confluence")
+        buy_factors.append("The daily chart shows sellers are out of strength.")
 
     if d1["structural_high"] - d1["price"] <= 1.5 * d1["atr"]:
         exit_score += 10
-        exit_factors.append("🌍 1D Context: Near Macro Peak")
+        exit_factors.append("The daily chart confirms we are at a major cycle top.")
     if d1["rsi"] > 65 or d1["bearish_div"]:
         exit_score += 5
-        exit_factors.append("🌍 1D Context: RSI/Div Exhaustion")
+        exit_factors.append("The daily chart shows the rally is exhausted.")
 
-    # Capping and Thresholds
     buy_score = min(buy_score, 100)
     exit_score = min(exit_score, 100)
 
     buy_sig = "CONFIRMED_BUY" if buy_score >= 65 and (d4["hist_slope_up"] or d4["bullish_div"] or d4["macd_bullish_div"] or d4["lower_wick"] >= 0.35) else ("EARLY_ACCUM" if buy_score >= 45 else None)
     exit_sig = "CONFIRMED_EXIT" if exit_score >= 65 and (d4["hist_slope_down"] or d4["bearish_div"] or d4["macd_bearish_div"] or d4["upper_wick"] >= 0.35) else ("APPROACHING_TOP" if exit_score >= 45 else None)
 
-    return buy_sig, buy_score, buy_factors, exit_sig, exit_score, exit_factors
+    return buy_sig, buy_factors, exit_sig, exit_factors
 
-# --- DYNAMIC MOVER DISCOVERY WITH CLEAN ERROR LOGGING ---
+# --- DYNAMIC MOVER DISCOVERY ---
 def get_dynamic_movers(top_n=3):
     url = "https://data-api.binance.vision/api/v3/ticker/24hr"
     try:
@@ -523,17 +506,13 @@ def get_dynamic_movers(top_n=3):
         res.raise_for_status()
         tickers = res.json()
         if not isinstance(tickers, list):
-            logger.error(f"Unexpected ticker format returned: {type(tickers)}")
             return [], []
             
         l1s = sorted([t for t in tickers if t.get("symbol") in L1_L2_UNIVERSE and t.get("symbol") not in CORE_WATCHLIST], key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)
         ais = sorted([t for t in tickers if t.get("symbol") in AI_UNIVERSE and t.get("symbol") not in CORE_WATCHLIST], key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)
         return [t["symbol"] for t in l1s[:top_n]], [t["symbol"] for t in ais[:top_n]]
-    except requests.RequestException as e:
-        logger.error(f"Network error fetching 24h tickers: {e}")
-        return [], []
-    except (ValueError, KeyError, TypeError) as e:
-        logger.error(f"Data parsing error on 24h tickers: {e}")
+    except Exception as e:
+        logger.error(f"Error fetching dynamic movers: {e}")
         return [], []
 
 # --- MAIN WORKFLOW CONTROLLER ---
@@ -554,47 +533,53 @@ def check_market():
             d1 = fetch_candle_data(symbol, "1d")
             ob = analyze_liquidity(symbol, d4["price"], d4["atr"])
 
-            buy_sig, buy_score, buy_factors, exit_sig, exit_score, exit_factors = evaluate_signals(d4, d1, ob)
+            buy_sig, buy_factors, exit_sig, exit_factors = evaluate_signals(d4, d1, ob)
 
-            # Price formatting
             p_str = format_price(d4["price"])
             floor_str = format_price(ob["bid_support"])
             ceil_str = format_price(ob["ask_resistance"])
 
-            # Actionable depth (consumes asks for spot buy, bids for spot exit)
-            buy_exec_depth = f"Available Asks (1% Slippage Band): ${ob['ask_depth_1pct']:,.0f}"
-            exit_exec_depth = f"Available Bids (1% Slippage Band): ${ob['bid_depth_1pct']:,.0f}"
+            # Human-readable execution sizing
+            buy_depth_str = f"Safe Instant Buy Size: Up to ${ob['ask_depth_1pct']:,.0f} before price moves 1%"
+            exit_depth_str = f"Safe Instant Sell Size: Up to ${ob['bid_depth_1pct']:,.0f} before price drops 1%"
 
-            # Append to manual summary report
+            # Append to manual diagnostic report
             status = "⚪ Neutral"
-            if buy_sig: status = f"🟢 {buy_sig} ({buy_score}/100)"
-            elif exit_sig: status = f"🔴 {exit_sig} ({exit_score}/100)"
-            
-            manual_summary += (f"• *{coin_name}*: ${p_str} | Status: {status} | Floor: ${floor_str}\n")
+            if buy_sig == "CONFIRMED_BUY":
+                status = "🟢 Confirmed Reversal"
+            elif buy_sig == "EARLY_ACCUM":
+                status = "🟡 Setting up for a Buy"
+            elif exit_sig == "CONFIRMED_EXIT":
+                status = "🔴 Confirmed Top"
+            elif exit_sig == "APPROACHING_TOP":
+                status = "🟠 Overheated / Take Profit"
 
+            wall_display = floor_str if buy_sig else (ceil_str if exit_sig else "--")
+            manual_summary += f"• *{coin_name}*: ${p_str} | Status: {status} | Key Wall: ${wall_display}\n"
+
+            # Dispatch Buy Alert
             if buy_sig and not check_alert_cooldown(symbol, buy_sig, d4["price"], d4["atr"]):
                 alerts_fired += 1
-                tag = "🟢 CONFIRMED REVERSAL" if buy_sig == "CONFIRMED_BUY" else "🟡 EARLY ACCUMULATION"
+                tag = "🟢 CONFIRMED BOTTOM REVERSAL" if buy_sig == "CONFIRMED_BUY" else "🟡 EARLY BOTTOM WARNING"
                 msg = (f"{tag} : {coin_name}\n\n"
-                       f"• *Closed Price:* ${p_str} (EMA200: {d4['ema200_ext']:+.1f}%)\n"
-                       f"• *Confluence Score:* {buy_score}/100\n"
-                       f"• 🛡️ *Cluster Support:* ${floor_str}\n"
-                       f"• 💧 *Execution Depth:* {buy_exec_depth}\n\n"
-                       f"*Confluence Evidence:*\n• " + "\n• ".join(buy_factors) + "\n\n"
-                       f"📍 *Execution:* Downside accumulation detected. Assess ask liquidity for entry sizing.")
+                       f"• *Current Price:* ${p_str}\n"
+                       f"• 🛡️ *Whale Buy Wall (Support):* ${floor_str}\n"
+                       f"• 💧 *{buy_depth_str}*\n\n"
+                       f"*Why the bot flagged this:*\n• " + "\n• ".join(buy_factors) + "\n\n"
+                       f"📍 *What to do:* Big money is stepping in. Do NOT market buy. Consider placing a Spot Limit Buy near the support wall at **${floor_str}**.")
                 send_telegram(msg)
                 record_alert(symbol, buy_sig, d4["price"])
 
+            # Dispatch Exit Alert
             if exit_sig and not check_alert_cooldown(symbol, exit_sig, d4["price"], d4["atr"]):
                 alerts_fired += 1
-                tag = "🔴 TRUE EXHAUSTION" if exit_sig == "CONFIRMED_EXIT" else "🟠 APPROACHING TOP"
+                tag = "🔴 CONFIRMED TOP EXHAUSTION" if exit_sig == "CONFIRMED_EXIT" else "🟠 RALLY OVERHEATING"
                 msg = (f"{tag} : {coin_name}\n\n"
-                       f"• *Closed Price:* ${p_str} (EMA200: {d4['ema200_ext']:+.1f}%)\n"
-                       f"• *Confluence Score:* {exit_score}/100\n"
-                       f"• 🎯 *Cluster Resistance:* ${ceil_str}\n"
-                       f"• 💧 *Execution Depth:* {exit_exec_depth}\n\n"
-                       f"*Exhaustion Evidence:*\n• " + "\n• ".join(exit_factors) + "\n\n"
-                       f"📍 *Execution:* Peak distribution/exhaustion detected. Assess bid liquidity for exit sizing.")
+                       f"• *Current Price:* ${p_str}\n"
+                       f"• 🎯 *Whale Sell Wall (Resistance):* ${ceil_str}\n"
+                       f"• 💧 *{exit_depth_str}*\n\n"
+                       f"*Why the bot flagged this:*\n• " + "\n• ".join(exit_factors) + "\n\n"
+                       f"📍 *What to do:* The rally is running out of steam. Consider taking spot profits into USDT near current prices. Do not chase or buy here.")
                 send_telegram(msg)
                 record_alert(symbol, exit_sig, d4["price"])
 
@@ -604,7 +589,7 @@ def check_market():
             logger.error(f"Failed analysis for {symbol}: {e}")
             continue
 
-    # If triggered manually via GitHub button, send diagnostic summary so you know it ran
+    # Dispatch manual diagnostic summary when triggered via "Run workflow"
     if RUN_MODE != "schedule":
         manual_summary += f"\n──────────────\n✅ *Scan Complete.* {len(full_watchlist)} coins checked. {alerts_fired} active signal(s) triggered."
         send_telegram(manual_summary)
