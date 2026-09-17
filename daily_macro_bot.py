@@ -39,68 +39,24 @@ STATE_FILE = "daily_state.json"
 
 
 # ============================================================
-# VETTED ASSET UNIVERSES
-# SPOT-ONLY / 1D MACRO
-#
-# This is aligned with the 4H bot universe.
-# CNPY, NIGHT and TRX were missing from the previous 1D list.
-# ============================================================
-
+# --- VETTED ASSET UNIVERSES (Spot-Only) ---
 CORE_WATCHLIST = [
-    "SOLUSDT",
-    "XRPUSDT",
-    "CNPYUSDT",
-    "ADAUSDT",
-    "SUIUSDT",
-    "LINKUSDT",
-    "XLMUSDT",
-    "ALGOUSDT",
-    "NIGHTUSDT",
-    "POLUSDT",
-    "FETUSDT",
-    "TONUSDT",
-    "AVAXUSDT",
-    "NEARUSDT",
-    "TRXUSDT",
-    "KITEUSDT"
+    "SOLUSDT", "XRPUSDT", "CNPYUSDT", "ADAUSDT", "SUIUSDT", "LINKUSDT",
+    "XLMUSDT", "ALGOUSDT", "NIGHTUSDT", "POLUSDT", "FETUSDT", "TONUSDT",
+    "AVAXUSDT", "NEARUSDT", "TRXUSDT", "KITEUSDT"
 ]
 
 L1_L2_UNIVERSE = [
-    "APTUSDT",
-    "SEIUSDT",
-    "INJUSDT",
-    "TIAUSDT",
-    "ARBUSDT",
-    "OPUSDT",
-    "HBARUSDT",
-    "ICPUSDT",
-    "KASUSDT",
-    "FTMUSDT",
-    "EGLDUSDT",
-    "FLOWUSDT",
-    "STXUSDT",
-    "ROSEUSDT",
-    "CELOUSDT"
+    "APTUSDT", "SEIUSDT", "INJUSDT", "TIAUSDT", "ARBUSDT",
+    "OPUSDT", "HBARUSDT", "ICPUSDT", "FTMUSDT",
+    "EGLDUSDT", "FLOWUSDT", "STXUSDT", "ROSEUSDT", "CELOUSDT"
 ]
 
 AI_UNIVERSE = [
-    "TAOUSDT",
-    "RENDERUSDT",
-    "GRTUSDT",
-    "THETAUSDT",
-    "AKTUSDT",
-    "ARKMUSDT",
-    "GLMUSDT",
-    "RLCUSDT",
-    "IOUSDT",
-    "JASMYUSDT",
-    "IQUSDT",
-    "NMRUSDT",
-    "PHBUSDT",
-    "TRACUSDT",
-    "PHAUSDT"
+    "TAOUSDT", "RENDERUSDT", "GRTUSDT", "THETAUSDT", "AKTUSDT",
+    "ARKMUSDT", "GLMUSDT", "RLCUSDT", "IOUSDT", "JASMYUSDT",
+    "IQUSDT", "NMRUSDT", "PHBUSDT", "TRACUSDT", "PHAUSDT"
 ]
-
 
 # ============================================================
 # RESILIENT HTTP SESSION
