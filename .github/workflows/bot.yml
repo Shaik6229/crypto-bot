@@ -5,9 +5,6 @@ on:
     - cron: '0 */4 * * *' # Runs every 4 hours automatically
   workflow_dispatch: # Allows manual trigger anytime
 
-permissions:
-  contents: write
-
 jobs:
   run-bot:
     runs-on: ubuntu-latest
@@ -28,22 +25,3 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: python bot.py
-
-      - name: Persist Bot State
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # Only add the file IF it was created by the python script
-          if [ -f bot_state.json ]; then
-            git add bot_state.json
-          fi
-          
-          # Commit and push if there are new changes
-          if ! git diff --cached --quiet; then
-            git commit -m "chore: update bot_state.json [skip ci]"
-            git pull --rebase origin HEAD
-            git push origin HEAD
-          else
-            echo "No new state to save. Skipping commit."
-          fi
