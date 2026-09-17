@@ -178,6 +178,11 @@
         "notional": 453582.2475
       },
       "time": 1789548800.6312451
+    },
+    "alert": {
+      "signal": "SELL_EARLY",
+      "price": 2.874,
+      "time": 1789658099.5721712
     }
   },
   "KITEUSDT": {
