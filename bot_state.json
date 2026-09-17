@@ -139,6 +139,11 @@
         "notional": 97766.88193999998
       },
       "time": 1789548795.5968783
+    },
+    "alert": {
+      "signal": "ACCUMULATION_IGNITION",
+      "price": 0.1637,
+      "time": 1789662854.351453
     }
   },
   "TONUSDT": {
