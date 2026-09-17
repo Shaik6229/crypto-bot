@@ -1,4 +1,3 @@
-import json
 import logging
 import os
 import time
@@ -27,15 +26,7 @@ logger = logging.getLogger("DailyMacroBot")
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
-
-# GitHub:
-#   workflow_dispatch = manual run
-#   schedule          = scheduled run
-#
-# Manual scans intentionally BYPASS the alert cooldown.
 RUN_MODE = os.environ.get("GITHUB_EVENT_NAME", "workflow_dispatch")
-
-STATE_FILE = "daily_state.json"
 
 
 # ============================================================
@@ -103,105 +94,6 @@ def format_price(val):
         return f"{val:.6f}"
     else:
         return f"{val:.8f}"
-
-
-# ============================================================
-# STATE PERSISTENCE
-# INDEPENDENT 48-HOUR BUY / EXIT COOLDOWNS
-# ============================================================
-
-def load_state():
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r") as f:
-                return json.load(f)
-
-        except Exception as e:
-            logger.warning(f"Could not load state file: {e}")
-
-    return {}
-
-
-def save_state(state):
-    try:
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f, indent=2)
-
-    except Exception as e:
-        logger.warning(f"Could not save state file: {e}")
-
-
-STATE = load_state()
-
-
-def check_alert_cooldown(symbol, signal_type, current_price, atr):
-    """
-    Returns True when the same signal should be suppressed.
-
-    BUY and EXIT are completely independent because they use
-    separate signal_type keys.
-
-    NOTE:
-    This function is only called for scheduled runs.
-    Manual scans intentionally bypass it.
-    """
-
-    symbol_state = STATE.get(symbol, {})
-
-    # Safe migration from legacy state format.
-    if "alerts" not in symbol_state:
-        symbol_state["alerts"] = {}
-
-        if "alert" in symbol_state:
-            old_sig = symbol_state["alert"].get("signal")
-
-            if old_sig:
-                symbol_state["alerts"][old_sig] = symbol_state["alert"]
-
-    last_record = symbol_state.get("alerts", {}).get(signal_type, {})
-
-    if not last_record:
-        return False
-
-    last_time = last_record.get("time", 0)
-    last_price = last_record.get("price", 0)
-
-    time_elapsed = time.time() - last_time
-
-    price_moved = (
-        atr > 0
-        and abs(current_price - last_price) >= (1.5 * atr)
-    )
-
-    # 48 hours = 172800 seconds.
-    if time_elapsed < 172800 and not price_moved:
-        return True
-
-    return False
-
-
-def record_alert(symbol, signal_type, price):
-    if symbol not in STATE:
-        STATE[symbol] = {}
-
-    # Safe migration from legacy state format.
-    if "alerts" not in STATE[symbol]:
-        STATE[symbol]["alerts"] = {}
-
-        if "alert" in STATE[symbol]:
-            old_sig = STATE[symbol]["alert"].get("signal")
-
-            if old_sig:
-                STATE[symbol]["alerts"][old_sig] = STATE[symbol]["alert"]
-
-            del STATE[symbol]["alert"]
-
-    STATE[symbol]["alerts"][signal_type] = {
-        "price": price,
-        "time": time.time()
-    }
-
-    save_state(STATE)
 
 
 # ============================================================
@@ -356,27 +248,16 @@ def calculate_wilder_rsi(closes, period=14):
 
 
 def calculate_ema(data, period):
-    """
-    Conventional EMA with SMA initialization.
-
-    This is a calculation cleanup only.
-    It does not change any strategy threshold or EMA200 gating
-    because EMA200 remains a scoring/context factor only.
-    """
-
     n = len(data)
 
     if n == 0:
         return []
 
     if n < period:
-        # Not enough data for a conventional SMA seed.
-        # Return a stable fallback so callers don't crash.
         return [data[0]] * n
 
     ema = [data[0]] * n
 
-    # Conventional SMA seed.
     seed = sum(data[:period]) / period
 
     ema[period - 1] = seed
@@ -389,7 +270,6 @@ def calculate_ema(data, period):
             + ema[i - 1] * (1.0 - k)
         )
 
-    # Fill warm-up values with the first valid EMA.
     for i in range(period - 1):
         ema[i] = seed
 
@@ -477,16 +357,6 @@ def fetch_1d_data(symbol, limit=450):
 
     raw = res.json()
 
-    # --------------------------------------------------------
-    # Minimum data validation
-    #
-    # We need enough history for:
-    # - 200D EMA
-    # - 200D rolling structural range
-    # - RSI / MACD / ATR warmup
-    # - confirmed 5-bar pivots
-    # --------------------------------------------------------
-
     if not isinstance(raw, list):
         raise ValueError(
             f"{symbol}: Binance returned invalid kline data."
@@ -541,8 +411,6 @@ def fetch_1d_data(symbol, limit=450):
 
     _, _, macd_hist = calculate_macd(closes)
 
-    # EMA200 is a context/scoring measurement only.
-    # It is NOT a hard gate.
     ema200 = calculate_ema(closes, 200)
 
     atr = calculate_atr(
@@ -573,9 +441,6 @@ def fetch_1d_data(symbol, limit=450):
 
     # --------------------------------------------------------
     # 200-DAY ROLLING STRUCTURAL EXTREMES
-    #
-    # These are rolling 200-day extremes, NOT all-time cycle
-    # highs/lows.
     # --------------------------------------------------------
 
     struct_start = max(
@@ -605,9 +470,6 @@ def fetch_1d_data(symbol, limit=450):
 
     # --------------------------------------------------------
     # RECENT CONFIRMED LOCAL SWING PIVOTS
-    # 5-left / 5-right fractal.
-    #
-    # The current candle is never used as a confirmed pivot.
     # --------------------------------------------------------
 
     local_lows = [
@@ -732,9 +594,6 @@ def fetch_1d_data(symbol, limit=450):
 
     # --------------------------------------------------------
     # VOLUME
-    #
-    # Median of the preceding 20 completed candles.
-    # Current candle is excluded from the baseline.
     # --------------------------------------------------------
 
     vol_window = volumes[
@@ -753,88 +612,39 @@ def fetch_1d_data(symbol, limit=450):
     if candle_range <= 0:
         candle_range = 0.0
 
-    # --------------------------------------------------------
-    # RETURN CONTEXT
-    # --------------------------------------------------------
-
     return {
         "price": c_close,
-
-        # Explicitly rolling 200D structural levels.
         "structural_low": struct_low,
         "structural_high": struct_high,
-
         "rsi": c_rsi,
-
-        "hist_slope_up": (
-            c_hist > prev_hist
-        ),
-
-        "hist_slope_down": (
-            c_hist < prev_hist
-        ),
-
-        "strong_rsi_bull_div":
-            strong_rsi_bull_div,
-
-        "strong_macd_bull_div":
-            strong_macd_bull_div,
-
-        "early_bull_div":
-            early_bull_div,
-
-        "strong_rsi_bear_div":
-            strong_rsi_bear_div,
-
-        "strong_macd_bear_div":
-            strong_macd_bear_div,
-
-        "early_bear_div":
-            early_bear_div,
-
-        "vol_ratio": (
-            volumes[idx] / vol_median
-            if vol_median > 0
-            else 1.0
-        ),
-
+        "hist_slope_up": (c_hist > prev_hist),
+        "hist_slope_down": (c_hist < prev_hist),
+        "strong_rsi_bull_div": strong_rsi_bull_div,
+        "strong_macd_bull_div": strong_macd_bull_div,
+        "early_bull_div": early_bull_div,
+        "strong_rsi_bear_div": strong_rsi_bear_div,
+        "strong_macd_bear_div": strong_macd_bear_div,
+        "early_bear_div": early_bear_div,
+        "vol_ratio": (volumes[idx] / vol_median if vol_median > 0 else 1.0),
         "lower_wick": (
-            (
-                min(opens[idx], c_close)
-                - c_low
-            ) / candle_range
+            (min(opens[idx], c_close) - c_low) / candle_range
             if candle_range > 0
             else 0.0
         ),
-
         "upper_wick": (
-            (
-                c_high
-                - max(opens[idx], c_close)
-            ) / candle_range
+            (c_high - max(opens[idx], c_close)) / candle_range
             if candle_range > 0
             else 0.0
         ),
-
-        # EMA200 remains measurement/context only.
         "ema200_ext": (
-            (c_close - ema200[idx])
-            / ema200[idx]
-            * 100.0
+            (c_close - ema200[idx]) / ema200[idx] * 100.0
         ),
-
         "atr": c_atr
     }
 
 
 # ============================================================
 # 1D MACRO SCORING ENGINE
-#
-# IMPORTANT:
-# - BUY and EXIT are independent.
-# - EMA200 is NOT a hard filter.
-# - Threshold remains 40.
-# - No new indicators added.
 # ============================================================
 
 def evaluate_macro(d1):
@@ -875,7 +685,6 @@ def evaluate_macro(d1):
                 "macro low (Potential Absorption)."
             )
 
-    # EMA200 is ONLY a score.
     if d1["ema200_ext"] < -20.0:
 
         buy_score += 10
@@ -894,10 +703,6 @@ def evaluate_macro(d1):
             f"Daily RSI deeply oversold "
             f"({d1['rsi']:.1f})."
         )
-
-    # --------------------------------------------------------
-    # STRATIFIED BULLISH DIVERGENCE
-    # --------------------------------------------------------
 
     if d1["strong_rsi_bull_div"]:
 
@@ -979,7 +784,6 @@ def evaluate_macro(d1):
                 "macro high (Potential Distribution)."
             )
 
-    # EMA200 is ONLY a score.
     if d1["ema200_ext"] > 35.0:
 
         exit_score += 10
@@ -998,10 +802,6 @@ def evaluate_macro(d1):
             f"Daily RSI heavily overbought "
             f"({d1['rsi']:.1f})."
         )
-
-    # --------------------------------------------------------
-    # STRATIFIED BEARISH DIVERGENCE
-    # --------------------------------------------------------
 
     if d1["strong_rsi_bear_div"]:
 
@@ -1053,12 +853,6 @@ def evaluate_macro(d1):
         exit_factors.append(
             "Strong daily upper-wick rejection."
         )
-
-    # --------------------------------------------------------
-    # SIGNAL THRESHOLDS
-    #
-    # Intentionally remains 40 for early macro detection.
-    # --------------------------------------------------------
 
     buy_sig = (
         "MACRO_BUY"
@@ -1156,34 +950,6 @@ def check_macro_market():
         "Initializing 1D Macro Scanner..."
     )
 
-    logger.info(
-        f"RUN_MODE = {RUN_MODE}"
-    )
-
-    # --------------------------------------------------------
-    # Manual scan behavior:
-    #
-    # ANYTHING other than GitHub scheduled execution is
-    # considered manual for cooldown purposes.
-    #
-    # Therefore:
-    #   workflow_dispatch -> cooldown BYPASS
-    #   schedule          -> cooldown ACTIVE
-    # --------------------------------------------------------
-
-    cooldown_enabled = (
-        RUN_MODE == "schedule"
-    )
-
-    if cooldown_enabled:
-        logger.info(
-            "Scheduled scan: 48-hour alert cooldown ACTIVE."
-        )
-    else:
-        logger.info(
-            "Manual scan: alert cooldown BYPASSED."
-        )
-
     # --------------------------------------------------------
     # Dynamic top movers
     # --------------------------------------------------------
@@ -1202,18 +968,10 @@ def check_macro_market():
         f"Scanning {len(full_watchlist)} symbols."
     )
 
-    logger.info(
-        f"Top L1/L2 movers: {top_l1}"
-    )
-
-    logger.info(
-        f"Top AI movers: {top_ai}"
-    )
-
     alerts_fired = 0
 
     manual_summary = (
-        "🌍 *[MANUAL 1D MACRO DIAGNOSTIC]* 🌍\n"
+        "🌍 *[1D MACRO DIAGNOSTIC]* 🌍\n"
         "_Daily timeframe scan complete:_\n\n"
     )
 
@@ -1293,26 +1051,9 @@ def check_macro_market():
 
             # =================================================
             # BUY ALERT
-            #
-            # Manual:
-            #   ALWAYS allowed if signal exists.
-            #
-            # Scheduled:
-            #   48h cooldown applies.
             # =================================================
 
-            buy_blocked = False
-
-            if buy_sig and cooldown_enabled:
-
-                buy_blocked = check_alert_cooldown(
-                    symbol,
-                    buy_sig,
-                    d1["price"],
-                    d1["atr"]
-                )
-
-            if buy_sig and not buy_blocked:
+            if buy_sig:
 
                 alerts_fired += 1
 
@@ -1349,36 +1090,12 @@ def check_macro_market():
 
                 send_telegram(msg)
 
-                record_alert(
-                    symbol,
-                    buy_sig,
-                    d1["price"]
-                )
 
             # =================================================
             # EXIT ALERT
-            #
-            # BUY and EXIT cooldowns are independent.
-            #
-            # Manual:
-            #   ALWAYS allowed if signal exists.
-            #
-            # Scheduled:
-            #   48h cooldown applies.
             # =================================================
 
-            exit_blocked = False
-
-            if exit_sig and cooldown_enabled:
-
-                exit_blocked = check_alert_cooldown(
-                    symbol,
-                    exit_sig,
-                    d1["price"],
-                    d1["atr"]
-                )
-
-            if exit_sig and not exit_blocked:
+            if exit_sig:
 
                 alerts_fired += 1
 
@@ -1414,11 +1131,6 @@ def check_macro_market():
 
                 send_telegram(msg)
 
-                record_alert(
-                    symbol,
-                    exit_sig,
-                    d1["price"]
-                )
 
             # ------------------------------------------------
             # POLITELY SPACE TELEGRAM / API REQUESTS
@@ -1444,9 +1156,7 @@ def check_macro_market():
             "\n──────────────\n"
             f"✅ *1D Scan Complete.* "
             f"{len(full_watchlist)} coins checked. "
-            f"{alerts_fired} new macro alert(s) triggered.\n\n"
-            "ℹ️ *Manual scan:* "
-            "48-hour cooldown was bypassed."
+            f"{alerts_fired} macro alert(s) sent."
         )
 
         send_telegram(
