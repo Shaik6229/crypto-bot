@@ -126,7 +126,8 @@ def calculate_rma(data, period):
     rma = [0.0] * n
     if n < period: return rma
     rma[period - 1] = sum(data[:period]) / period
-    for i in range(period, n): rma[i] = (rma[i - 1] * (period - 1) + data[i]) / period
+    for i in range(period, n):
+        rma[i] = (rma[i - 1] * (period - 1) + data[i]) / period
     for i in range(period - 1): rma[i] = rma[period - 1]
     return rma
 
@@ -153,7 +154,7 @@ def fetch_1d_context(symbol):
         res.raise_for_status()
         raw = res.json()
         closes = [float(c[4]) for c in raw]
-        idx = len(closes) - 2  # Anchor to Closed 1D candle
+        idx = len(closes) - 2  # Anchor to closed daily candle
         
         rsi_series = calculate_wilder_rsi(closes)
         ema50 = calculate_ema(closes, 50)
@@ -265,7 +266,84 @@ def fetch_order_book(symbol, current_price):
         logger.warning(f"Could not fetch order book for {symbol}: {e}")
         return {"bid_depth_1pct": 0, "ask_depth_1pct": 0, "bid_wall_price": current_price, "ask_wall_price": current_price}
 
-# --- 4H SCORING & INDEPENDENT SETUP EVALUATION ---
+# --- DIRECTIONAL PREDICTION ENGINE (FOR MANUAL DIAGNOSTIC) ---
+def analyze_market_direction(c4, ob, d1):
+    p = c4["price"]
+    up_score = 0
+    down_score = 0
+    drivers = []
+
+    # 1. EMA Trend Stack
+    if p > c4["ema20"]:
+        up_score += 2
+        drivers.append("holding >20-EMA")
+    else:
+        down_score += 2
+        drivers.append("trapped <20-EMA")
+
+    if p > c4["ema50"]:
+        up_score += 1
+    else:
+        down_score += 1
+
+    # 2. MACD Momentum
+    if c4["hist_slope_up"]:
+        up_score += 2
+        drivers.append("MACD curling up")
+    elif c4["hist_slope_down"]:
+        down_score += 2
+        drivers.append("MACD fading down")
+
+    # 3. RSI Flow
+    if c4["rsi"] >= 52:
+        up_score += 1
+    elif c4["rsi"] <= 48:
+        down_score += 1
+
+    if c4["bullish_div"]:
+        up_score += 2
+        drivers.append("bullish divergence")
+    elif c4["bearish_div"]:
+        down_score += 2
+        drivers.append("bearish divergence")
+
+    # 4. Macro 1D Context
+    if not d1["is_bearish"]:
+        up_score += 1
+    else:
+        down_score += 1
+        drivers.append("1D downtrend drag")
+
+    # 5. Liquidity Support
+    if ob["bid_depth_1pct"] > (1.2 * ob["ask_depth_1pct"]):
+        up_score += 1
+    elif ob["ask_depth_1pct"] > (1.2 * ob["bid_depth_1pct"]):
+        down_score += 1
+
+    # Determine Verdict & Targets
+    reason_str = ", ".join(drivers[:2]) if drivers else "mixed technical factors"
+
+    if up_score >= down_score + 2:
+        verdict = "🔼 UP BIAS"
+        targets = [v for v in [c4["ema50"], c4["ema200"], c4["consolidation_high"], c4["structural_high"]] if v > p * 1.005]
+        target_price = min(targets) if targets else p * 1.05
+        floors = [v for v in [c4["ema20"], ob["bid_wall_price"], c4["structural_low"]] if v < p * 0.995]
+        floor_price = max(floors) if floors else p * 0.95
+        action_note = f"Target: ${format_price(target_price)} | Support: ${format_price(floor_price)} ({reason_str})"
+    elif down_score >= up_score + 2:
+        verdict = "🔽 DOWN BIAS"
+        targets = [v for v in [c4["ema20"], c4["ema50"], ob["bid_wall_price"], c4["structural_low"]] if v < p * 0.995]
+        target_price = max(targets) if targets else p * 0.95
+        ceilings = [v for v in [c4["ema20"], c4["ema50"], ob["ask_wall_price"]] if v > p * 1.005]
+        ceiling_price = min(ceilings) if ceilings else p * 1.05
+        action_note = f"Downside: ${format_price(target_price)} | Ceiling: ${format_price(ceiling_price)} ({reason_str})"
+    else:
+        verdict = "⚖️ SIDEWAYS"
+        action_note = f"Range: ${format_price(c4['low'])} – ${format_price(c4['high'])} (Chop / Indecision)"
+
+    return verdict, action_note
+
+# --- 4H SCORING & SETUP EVALUATION (FROZEN LIVE STRATEGY) ---
 def evaluate_market_condition(c4, ob, d1):
     p = c4["price"]
     ema20 = c4["ema20"]
@@ -356,7 +434,6 @@ def evaluate_market_condition(c4, ob, d1):
     if d1["is_bearish"]:
         buy_score = max(0, buy_score - 25)
 
-    # 4. RESOLVE INDEPENDENT SIGNALS
     if buy_score >= 65: active_setups.append({"type": "BUY_CONFIRMED", "score": buy_score, "reasons": buy_factors})
     elif buy_score >= 45: active_setups.append({"type": "BUY_EARLY", "score": buy_score, "reasons": buy_factors})
 
@@ -382,7 +459,10 @@ def check_4h_market():
     full_watchlist = list(dict.fromkeys(CORE_WATCHLIST + top_l1 + top_ai))
     alerts_fired = 0
 
-    manual_summary = "📊 *[MANUAL 4H SCAN DIAGNOSTIC]* 📊\n_Closed candle analysis complete:_\n\n"
+    manual_summary = (
+        "🧭 *[MANUAL 4H MARKET DIRECTION REPORT]* 🧭\n"
+        "_Where prices are likely heading from current levels:_\n\n"
+    )
 
     for symbol in full_watchlist:
         coin_name = symbol.replace("USDT", "")
@@ -391,89 +471,86 @@ def check_4h_market():
             ob = fetch_order_book(symbol, c4["price"])
             d1 = fetch_1d_context(symbol)
             
-            setups = evaluate_market_condition(c4, ob, d1)
             p_str = format_price(c4["price"])
             support_str = format_price(ob["bid_wall_price"])
             resist_str = format_price(ob["ask_wall_price"])
 
-            if not setups:
-                manual_summary += f"• *{coin_name}*: ${p_str} | Status: ⚪ Neutral | 4H RSI: {c4['rsi']:.1f}\n"
-            else:
-                status_descs = []
-                for s in setups:
-                    if s["type"] == "RELIEF_SCALP": status_descs.append("⚡ Scalp")
-                    elif s["type"] == "ACCUMULATION_IGNITION": status_descs.append("🚀 Ignition")
-                    elif s["type"] == "BUY_CONFIRMED": status_descs.append("🟢 Conf Reversal")
-                    elif s["type"] == "BUY_EARLY": status_descs.append("🟡 Early Warn")
-                    elif s["type"] == "SELL_CONFIRMED": status_descs.append("🔴 Top Exhaust")
-                    elif s["type"] == "SELL_EARLY": status_descs.append("🟠 Overheating")
-                    
-                manual_summary += f"• *{coin_name}*: ${p_str} | Status: {', '.join(status_descs)} | 4H RSI: {c4['rsi']:.1f}\n"
+            # 1. Compute Directional Prediction for Manual Runs
+            if RUN_MODE != "schedule":
+                verdict, action_note = analyze_market_direction(c4, ob, d1)
+                manual_summary += (
+                    f"• *{coin_name}* (${p_str}) : *{verdict}*\n"
+                    f"  ↳ {action_note}\n\n"
+                )
 
-                for setup in setups:
-                    stype = setup["type"]
-                    alerts_fired += 1
+            # 2. Check Setups (Frozen Logic)
+            setups = evaluate_market_condition(c4, ob, d1)
+
+            for setup in setups:
+                stype = setup["type"]
+                alerts_fired += 1
+                
+                if stype == "RELIEF_SCALP":
+                    msg = (
+                        f"⚡ *4H COUNTER-TREND RELIEF SCALP* : {coin_name}\n\n"
+                        f"• *Entry Region:* ${format_price(c4['low'])} – ${p_str}\n"
+                        f"• 🛡️ *Largest Visible Bid Wall:* ${support_str}\n"
+                        f"• 📉 *Deviation from 4H 20-EMA:* {setup['ema_stretch']:.1f}%\n"
+                        f"• ⚡ *4H Panic RSI:* {c4['rsi']:.1f} | *Volume:* {c4['vol_ratio']:.1f}x Median\n"
+                        f"• 🌍 *1D Macro Context:* 🔴 Bearish Downtrend\n\n"
+                        f"*Tactical Plan:*\n"
+                        f"• 🎯 *Take Profit 1 (70%):* ${format_price(setup['tp1'])} (Retest 4H 20-EMA)\n"
+                        f"• 🎯 *Take Profit 2 (30%):* ${format_price(setup['tp2'])}\n"
+                        f"• 🛑 *Invalidation Stop:* Clean 4H close below ${format_price(setup['stop'])}\n\n"
+                        f"📍 *Execution Rule:* Bounce play. Scale out into USDT at targets."
+                    )
+                elif stype == "ACCUMULATION_IGNITION":
+                    msg = (
+                        f"🚀 *4H ACCUMULATION IGNITION* : {coin_name}\n\n"
+                        f"• *Current Price:* ${p_str}\n"
+                        f"• 📈 *Ignition Volume:* {c4['vol_ratio']:.1f}x Median\n"
+                        f"• ⏳ *Suppression Duration:* {c4['candles_below_ema20']} candles ({c4['candles_below_ema20']*4}h) below 20-EMA\n"
+                        f"• 🛡️ *Largest Visible Bid Wall:* ${support_str}\n\n"
+                        f"*Why the bot flagged this:*\n• " + "\n• ".join(setup["reasons"]) + "\n\n"
+                        f"*Tactical Plan:*\n"
+                        f"• 🎯 *Take Profit 1 (50%):* ${format_price(setup['tp1'])}\n"
+                        f"• 🎯 *Take Profit 2 (50%):* ${format_price(setup['tp2'])}\n"
+                        f"• 🛑 *Invalidation Stop:* Clean 4H close below ${format_price(setup['stop'])}\n\n"
+                        f"📍 *Execution Rule:* Scale into spot at market or on 20-EMA retest."
+                    )
+                elif stype in ["BUY_CONFIRMED", "BUY_EARLY"]:
+                    header = "🟢 *CONFIRMED BOTTOM REVERSAL*" if stype == "BUY_CONFIRMED" else "🟡 *EARLY BOTTOM WARNING*"
+                    msg = (
+                        f"{header} : {coin_name}\n\n"
+                        f"• *Current Price:* ${p_str}\n"
+                        f"• 🛡️ *Largest Visible Bid Wall (Support):* ${support_str}\n"
+                        f"• 💧 *Visible Ask Liquidity Within 1%:* ${ob['ask_depth_1pct']:,.0f}\n"
+                        f"• 🌍 *1D Macro RSI:* {d1['rsi']:.1f}\n\n"
+                        f"*Why the bot flagged this:*\n• " + "\n• ".join(setup["reasons"]) + "\n\n"
+                        f"📍 *What to do:* Bottom confluence detected. Consider Spot Limit Buy near support at **${support_str}**."
+                    )
+                elif stype in ["SELL_CONFIRMED", "SELL_EARLY"]:
+                    header = "🔴 *CONFIRMED TOP EXHAUSTION*" if stype == "SELL_CONFIRMED" else "🟠 *RALLY OVERHEATING*"
+                    msg = (
+                        f"{header} : {coin_name}\n\n"
+                        f"• *Current Price:* ${p_str}\n"
+                        f"• 🎯 *Largest Visible Ask Wall (Resistance):* ${resist_str}\n"
+                        f"• 💧 *Visible Bid Liquidity Within 1%:* ${ob['bid_depth_1pct']:,.0f}\n"
+                        f"• ⚡ *4H RSI:* {c4['rsi']:.1f}\n\n"
+                        f"*Why the bot flagged this:*\n• " + "\n• ".join(setup["reasons"]) + "\n\n"
+                        f"📍 *What to do:* Rally exhaustion detected. Consider spot profit-taking into USDT."
+                    )
                     
-                    if stype == "RELIEF_SCALP":
-                        msg = (
-                            f"⚡ *4H COUNTER-TREND RELIEF SCALP* : {coin_name}\n\n"
-                            f"• *Entry Region:* ${format_price(c4['low'])} – ${p_str}\n"
-                            f"• 🛡️ *Largest Visible Bid Wall:* ${support_str}\n"
-                            f"• 📉 *Deviation from 4H 20-EMA:* {setup['ema_stretch']:.1f}%\n"
-                            f"• ⚡ *4H Panic RSI:* {c4['rsi']:.1f} | *Volume:* {c4['vol_ratio']:.1f}x Median\n"
-                            f"• 🌍 *1D Macro Context:* 🔴 Bearish Downtrend\n\n"
-                            f"*Tactical Plan:*\n"
-                            f"• 🎯 *Take Profit 1 (70%):* ${format_price(setup['tp1'])} (Retest 4H 20-EMA)\n"
-                            f"• 🎯 *Take Profit 2 (30%):* ${format_price(setup['tp2'])}\n"
-                            f"• 🛑 *Invalidation Stop:* Clean 4H close below ${format_price(setup['stop'])}\n\n"
-                            f"📍 *Execution Rule:* This is NOT a cycle bottom. Treat as a short-duration bounce play. Scale out into USDT at targets and do NOT hold if rejected by the 20-EMA."
-                        )
-                    elif stype == "ACCUMULATION_IGNITION":
-                        msg = (
-                            f"🚀 *4H ACCUMULATION IGNITION* : {coin_name}\n\n"
-                            f"• *Current Price:* ${p_str}\n"
-                            f"• 📈 *Ignition Volume:* {c4['vol_ratio']:.1f}x Median\n"
-                            f"• ⏳ *Suppression Duration:* {c4['candles_below_ema20']} candles ({c4['candles_below_ema20']*4}h) below 20-EMA\n"
-                            f"• 🛡️ *Largest Visible Bid Wall:* ${support_str}\n\n"
-                            f"*Why the bot flagged this:*\n• " + "\n• ".join(setup["reasons"]) + "\n\n"
-                            f"*Tactical Plan:*\n"
-                            f"• 🎯 *Take Profit 1 (50%):* ${format_price(setup['tp1'])} (Retest 4H 50-EMA)\n"
-                            f"• 🎯 *Take Profit 2 (50%):* ${format_price(setup['tp2'])}\n"
-                            f"• 🛑 *Invalidation Stop:* Clean 4H close below ${format_price(setup['stop'])}\n\n"
-                            f"📍 *Execution Rule:* Slow bleed broken. Scale into spot at market or on a retest of the broken 20-EMA."
-                        )
-                    elif stype in ["BUY_CONFIRMED", "BUY_EARLY"]:
-                        header = "🟢 *CONFIRMED BOTTOM REVERSAL*" if stype == "BUY_CONFIRMED" else "🟡 *EARLY BOTTOM WARNING*"
-                        msg = (
-                            f"{header} : {coin_name}\n\n"
-                            f"• *Current Price:* ${p_str}\n"
-                            f"• 🛡️ *Largest Visible Bid Wall (Support):* ${support_str}\n"
-                            f"• 💧 *Visible Ask Liquidity Within 1%:* ${ob['ask_depth_1pct']:,.0f}\n"
-                            f"• 🌍 *1D Macro RSI:* {d1['rsi']:.1f}\n\n"
-                            f"*Why the bot flagged this:*\n• " + "\n• ".join(setup["reasons"]) + "\n\n"
-                            f"📍 *What to do:* Bottom/reversal confluence detected. Do NOT market buy. Place a Spot Limit Buy near support at **${support_str}**."
-                        )
-                    elif stype in ["SELL_CONFIRMED", "SELL_EARLY"]:
-                        header = "🔴 *CONFIRMED TOP EXHAUSTION*" if stype == "SELL_CONFIRMED" else "🟠 *RALLY OVERHEATING*"
-                        msg = (
-                            f"{header} : {coin_name}\n\n"
-                            f"• *Current Price:* ${p_str}\n"
-                            f"• 🎯 *Largest Visible Ask Wall (Resistance):* ${resist_str}\n"
-                            f"• 💧 *Visible Bid Liquidity Within 1%:* ${ob['bid_depth_1pct']:,.0f}\n"
-                            f"• ⚡ *4H RSI:* {c4['rsi']:.1f}\n\n"
-                            f"*Why the bot flagged this:*\n• " + "\n• ".join(setup["reasons"]) + "\n\n"
-                            f"📍 *What to do:* Rally is running out of steam. Consider taking spot profits into USDT near current levels."
-                        )
-                        
-                    send_telegram(msg)
-                    time.sleep(1.0)
+                send_telegram(msg)
+                time.sleep(1.0)
 
         except Exception as e:
             logger.error(f"Failed 4H analysis for {symbol}: {e}")
             continue
 
+    # Send the detailed directional diagnostic when manually triggered
     if RUN_MODE != "schedule":
-        manual_summary += f"\n──────────────\n✅ *4H Scan Complete.* {len(full_watchlist)} coins checked. {alerts_fired} active alert(s) sent."
+        manual_summary += f"──────────────\n✅ *Scan Complete.* {len(full_watchlist)} coins checked. {alerts_fired} active alert(s) sent."
         send_telegram(manual_summary)
 
 if __name__ == "__main__":
