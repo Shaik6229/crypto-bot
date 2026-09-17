@@ -19,13 +19,13 @@ STATE_FILE = "bot_state.json"
 # --- VETTED ASSET UNIVERSES (Shariah-Audited, Spot-Only) ---
 CORE_WATCHLIST = [
     "SOLUSDT", "XRPUSDT", "CNPYUSDT", "ADAUSDT", "SUIUSDT", "LINKUSDT",
-    "XLMUSDT", "ALGOUSDT","NIGHTUSDT", "POLUSDT", "FETUSDT", "TONUSDT",
+    "XLMUSDT", "ALGOUSDT", "NIGHTUSDT", "POLUSDT", "FETUSDT", "TONUSDT",
     "AVAXUSDT", "NEARUSDT", "TRXUSDT", "KITEUSDT"
 ]
 
 L1_L2_UNIVERSE = [
     "APTUSDT", "SEIUSDT", "INJUSDT", "TIAUSDT", "ARBUSDT",
-    "OPUSDT", "HBARUSDT", "ICPUSDT", "KASUSDT", "FTMUSDT",
+    "OPUSDT", "HBARUSDT", "ICPUSDT", "FTMUSDT",
     "EGLDUSDT", "FLOWUSDT", "STXUSDT", "ROSEUSDT", "CELOUSDT"
 ]
 
@@ -245,16 +245,21 @@ def fetch_4h_data(symbol, limit=200):
         closes.append(float(c[4]))
         volumes.append(float(c[5]))
 
-    idx = len(closes) - 2  # Anchor to the closed 4H candle
+    idx = len(closes) - 2  # Anchor strictly to the closed 4H candle
     rsi_series = calculate_wilder_rsi(closes)
     _, _, macd_hist = calculate_macd(closes)
     ema20 = calculate_ema(closes, 20)
     ema50 = calculate_ema(closes, 50)
-    ema200 = calculate_ema(closes, 200)
+    ema200 = calculate_ema(closes, min(len(closes), 200))
     atr = calculate_atr(highs, lows, closes)
 
-    c_close, c_low, c_high = closes[idx], lows[idx], highs[idx]
-    c_rsi, c_hist, c_atr = rsi_series[idx], macd_hist[idx], atr[idx]
+    c_open = opens[idx]
+    c_close = closes[idx]
+    c_low = lows[idx]
+    c_high = highs[idx]
+    c_rsi = rsi_series[idx]
+    c_hist = macd_hist[idx]
+    c_atr = atr[idx]
     prev_hist = macd_hist[idx - 1]
 
     prior_lows, prior_highs = lows[:idx], highs[:idx]
@@ -271,8 +276,20 @@ def fetch_4h_data(symbol, limit=200):
     vol_median = sorted(volumes[max(0, idx - 20):idx])[len(volumes[max(0, idx - 20):idx]) // 2] if volumes[max(0, idx - 20):idx] else 1.0
     candle_range = c_high - c_low
 
+    # Count consecutive candles trapped below 20-EMA prior to the closed candle
+    candles_below_ema20 = 0
+    for i in range(idx - 1, max(0, idx - 25), -1):
+        if closes[i] < ema20[i]:
+            candles_below_ema20 += 1
+        else:
+            break
+
+    # Local consolidation high over the past 12 candles prior to breakout
+    consolidation_high = max(highs[max(0, idx - 12):idx]) if idx > 0 else c_high
+
     return {
         "price": c_close,
+        "open": c_open,
         "low": c_low,
         "high": c_high,
         "structural_low": struct_low,
@@ -280,16 +297,20 @@ def fetch_4h_data(symbol, limit=200):
         "rsi": c_rsi,
         "hist_slope_up": c_hist > prev_hist,
         "hist_slope_down": c_hist < prev_hist,
+        "macd_hist_positive": c_hist > 0 and prev_hist <= 0,
         "bullish_div": c_low <= r_low * 1.015 and c_rsi > rsi_series[r_low_idx],
         "bearish_div": c_high >= r_high * 0.985 and c_rsi < rsi_series[r_high_idx],
         "vol_ratio": volumes[idx] / vol_median if vol_median > 0 else 1.0,
-        "lower_wick": (min(opens[idx], c_close) - c_low) / candle_range if candle_range > 0 else 0,
-        "upper_wick": (c_high - max(opens[idx], c_close)) / candle_range if candle_range > 0 else 0,
+        "lower_wick": (min(c_open, c_close) - c_low) / candle_range if candle_range > 0 else 0,
+        "upper_wick": (c_high - max(c_open, c_close)) / candle_range if candle_range > 0 else 0,
+        "bullish_candle": c_close > c_open,
         "ema20": ema20[idx],
         "ema50": ema50[idx],
         "ema200": ema200[idx],
         "ema200_ext": ((c_close - ema200[idx]) / ema200[idx]) * 100,
-        "atr": c_atr
+        "atr": c_atr,
+        "candles_below_ema20": candles_below_ema20,
+        "consolidation_high": consolidation_high
     }
 
 # --- LIVE BINANCE ORDER BOOK DEPTH ---
@@ -323,21 +344,20 @@ def fetch_order_book(symbol, current_price):
         logger.warning(f"Could not fetch order book for {symbol}: {e}")
         return {"bid_depth_1pct": 0, "ask_depth_1pct": 0, "bid_wall_price": current_price, "ask_wall_price": current_price, "bid_wall_usd": 0, "ask_wall_usd": 0}
 
-# --- 4H SCORING & RELIEF SCALP EVALUATION ---
+# --- 4H SCORING & SETUP EVALUATION ---
 def evaluate_market_condition(c4, ob, d1):
     p = c4["price"]
     ema20 = c4["ema20"]
     ema_stretch_20 = ((p - ema20) / ema20) * 100
 
     # 1. DEDICATED COUNTER-TREND RELIEF SCALP CHECK
-    # Trigger: 1D is Bearish + 4H is stretched >= 7.5% below 20-EMA + RSI <= 28 + Climax Vol + Bid Support
     is_climax_volume = c4["vol_ratio"] >= 2.2
     is_capitulation_rsi = c4["rsi"] <= 28.0
     is_heavy_stretch = ema_stretch_20 <= -7.5
     has_bid_support = ob["bid_depth_1pct"] > (1.25 * ob["ask_depth_1pct"]) or ob["bid_wall_price"] >= (p * 0.985)
 
     if d1["is_bearish"] and is_heavy_stretch and is_capitulation_rsi and is_climax_volume and has_bid_support:
-        tp1 = ema20  # Mean reversion to declining 20-EMA
+        tp1 = ema20
         tp2 = c4["structural_low"] if c4["structural_low"] > p else p * 1.08
         stop_loss = c4["low"] * 0.992
         return {
@@ -354,7 +374,33 @@ def evaluate_market_condition(c4, ob, d1):
             ]
         }
 
-    # 2. STANDARD 4H TACTICAL SCORING
+    # 2. DEDICATED ACCUMULATION IGNITION (Slow Bleed Reversal)
+    was_suppressed = c4["candles_below_ema20"] >= 10
+    reclaimed_ema20 = (p > ema20) and (c4["open"] <= ema20 * 1.005)
+    broke_range = p >= c4["consolidation_high"] * 0.998
+    is_ignition_vol = c4["vol_ratio"] >= 1.6
+    strong_bull_body = c4["bullish_candle"] and (c4["upper_wick"] <= 0.25)
+    macd_turned = c4["macd_hist_positive"] or c4["hist_slope_up"]
+
+    if was_suppressed and reclaimed_ema20 and broke_range and is_ignition_vol and strong_bull_body and macd_turned:
+        tp1 = c4["ema50"] if c4["ema50"] > p else p * 1.06
+        tp2 = c4["structural_high"] if c4["structural_high"] > p else p * 1.12
+        stop_loss = min(c4["low"], p * 0.96)
+        return {
+            "type": "ACCUMULATION_IGNITION",
+            "score": 80,
+            "tp1": tp1,
+            "tp2": tp2,
+            "stop": stop_loss,
+            "reasons": [
+                f"Breakout after {c4['candles_below_ema20']} candles ({c4['candles_below_ema20']*4}h) compressed below 4H 20-EMA.",
+                f"Ignition volume surge ({c4['vol_ratio']:.1f}x median) with clean close near highs.",
+                f"Reclaimed local consolidation high at ${format_price(c4['consolidation_high'])}.",
+                "MACD momentum flipped upward."
+            ]
+        }
+
+    # 3. STANDARD 4H TACTICAL SCORING
     buy_score, exit_score = 0, 0
     buy_factors, exit_factors = [], []
 
@@ -452,6 +498,8 @@ def check_4h_market():
             status_desc = "⚪ Neutral"
             if setup["type"] == "RELIEF_SCALP":
                 status_desc = "⚡ 4H Relief Scalp Active"
+            elif setup["type"] == "ACCUMULATION_IGNITION":
+                status_desc = "🚀 4H Accumulation Ignition"
             elif setup["type"] == "BUY_CONFIRMED":
                 status_desc = "🟢 Confirmed Reversal"
             elif setup["type"] == "BUY_EARLY":
@@ -482,7 +530,26 @@ def check_4h_market():
                 send_telegram(msg)
                 record_alert(symbol, "RELIEF_SCALP", c4["price"])
 
-            # 2. DISPATCH STANDARD BUY ALERTS
+            # 2. DISPATCH ACCUMULATION IGNITION (Slow Bleed Reversal)
+            elif setup["type"] == "ACCUMULATION_IGNITION" and (RUN_MODE != "schedule" or not check_alert_cooldown(symbol, "ACCUMULATION_IGNITION", c4["price"], c4["atr"])):
+                alerts_fired += 1
+                msg = (
+                    f"🚀 *4H ACCUMULATION IGNITION* : {coin_name}\n\n"
+                    f"• *Current Price:* ${p_str}\n"
+                    f"• 📈 *Ignition Volume:* {c4['vol_ratio']:.1f}x Median\n"
+                    f"• ⏳ *Suppression Duration:* {c4['candles_below_ema20']} candles ({c4['candles_below_ema20']*4}h) below 20-EMA\n"
+                    f"• 🛡️ *Whale Bid Floor:* ${support_str}\n\n"
+                    f"*Why the bot flagged this:*\n• " + "\n• ".join(setup["reasons"]) + "\n\n"
+                    f"*Tactical Plan:*\n"
+                    f"• 🎯 *Take Profit 1 (50%):* ${format_price(setup['tp1'])} (Retest 4H 50-EMA)\n"
+                    f"• 🎯 *Take Profit 2 (50%):* ${format_price(setup['tp2'])}\n"
+                    f"• 🛑 *Invalidation Stop:* Clean 4H close below ${format_price(setup['stop'])}\n\n"
+                    f"📍 *Execution Rule:* Slow bleed broken. Scale into spot at market or on a retest of the broken 20-EMA."
+                )
+                send_telegram(msg)
+                record_alert(symbol, "ACCUMULATION_IGNITION", c4["price"])
+
+            # 3. DISPATCH STANDARD BUY ALERTS
             elif setup["type"] in ["BUY_CONFIRMED", "BUY_EARLY"] and (RUN_MODE != "schedule" or not check_alert_cooldown(symbol, setup["type"], c4["price"], c4["atr"])):
                 alerts_fired += 1
                 header = "🟢 *CONFIRMED BOTTOM REVERSAL*" if setup["type"] == "BUY_CONFIRMED" else "🟡 *EARLY BOTTOM WARNING*"
@@ -498,7 +565,7 @@ def check_4h_market():
                 send_telegram(msg)
                 record_alert(symbol, setup["type"], c4["price"])
 
-            # 3. DISPATCH STANDARD SELL ALERTS
+            # 4. DISPATCH STANDARD SELL ALERTS
             elif setup["type"] in ["SELL_CONFIRMED", "SELL_EARLY"] and (RUN_MODE != "schedule" or not check_alert_cooldown(symbol, setup["type"], c4["price"], c4["atr"])):
                 alerts_fired += 1
                 header = "🔴 *CONFIRMED TOP EXHAUSTION*" if setup["type"] == "SELL_CONFIRMED" else "🟠 *RALLY OVERHEATING*"
