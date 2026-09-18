@@ -29,6 +29,18 @@ RUN_MODE = os.environ.get(
 
 
 # ================================================================
+# VOLATILITY NORMALIZATION SETTINGS
+#
+# These replace fixed percentage price-distance thresholds
+# with ATR-relative thresholds so the scanner adapts to
+# different volatility characteristics across assets.
+# ================================================================
+RELIEF_EMA20_STRETCH_ATR = 2.5
+
+EXTREME_EMA200_DISTANCE_ATR = 5.0
+
+
+# ================================================================
 # VETTED ASSET UNIVERSES — SPOT ONLY
 # ================================================================
 CORE_WATCHLIST = [
@@ -557,6 +569,37 @@ def fetch_4h_data(symbol, limit=500):
     prev_low = lows[idx - 1]
 
     # ============================================================
+    # ATR NORMALIZED DISTANCE FROM EMA200
+    #
+    # Positive = price above EMA200
+    # Negative = price below EMA200
+    #
+    # This replaces fixed +25% / -15% extension thresholds
+    # in the scoring and exhaustion engines.
+    # ============================================================
+    ema200_distance_atr = (
+        (
+            c_close - ema200[idx]
+        ) / c_atr
+        if c_atr > 0
+        else 0.0
+    )
+
+    # ============================================================
+    # ATR NORMALIZED DISTANCE FROM EMA20
+    #
+    # Positive = price above EMA20
+    # Negative = price below EMA20
+    # ============================================================
+    ema20_distance_atr = (
+        (
+            c_close - ema20[idx]
+        ) / c_atr
+        if c_atr > 0
+        else 0.0
+    )
+
+    # ============================================================
     # ORIGINAL / FROZEN STRUCTURAL MAP
     # ============================================================
     prior_lows = lows[:idx]
@@ -771,7 +814,6 @@ def fetch_4h_data(symbol, limit=500):
             c_rsi < prev_rsi
         ),
 
-        # NEW — independent bottom engine
         "rsi_turning_up": (
             c_rsi > prev_rsi
         ),
@@ -788,7 +830,6 @@ def fetch_4h_data(symbol, limit=500):
             c_hist < prev_hist
         ),
 
-        # NEW — independent bottom engine
         "macd_hist_strengthening": (
             c_hist > prev_hist
         ),
@@ -856,7 +897,7 @@ def fetch_4h_data(symbol, limit=500):
         ),
 
         # --------------------------------------------------------
-        # NEW — BOTTOM REVERSAL EVIDENCE
+        # BOTTOM REVERSAL EVIDENCE
         # --------------------------------------------------------
         "bullish_rejection": (
             lower_wick_ratio >= 0.25
@@ -896,7 +937,6 @@ def fetch_4h_data(symbol, limit=500):
             and prev_close >= ema20[idx - 1]
         ),
 
-        # NEW — bottom confirmation
         "above_ema20": (
             c_close > ema20[idx]
         ),
@@ -906,6 +946,12 @@ def fetch_4h_data(symbol, limit=500):
             and prev_close <= ema20[idx - 1]
         ),
 
+        # --------------------------------------------------------
+        # ORIGINAL PERCENT EXTENSION — KEPT FOR DISPLAY/CONTEXT
+        #
+        # It is no longer used as the extreme EMA200 scoring
+        # threshold. ATR-normalized distance is used instead.
+        # --------------------------------------------------------
         "ema200_ext": (
             (
                 (c_close - ema200[idx])
@@ -914,6 +960,12 @@ def fetch_4h_data(symbol, limit=500):
             if ema200[idx] != 0
             else 0
         ),
+
+        # NEW ATR-NORMALIZED EXTENSION
+        "ema200_distance_atr": ema200_distance_atr,
+
+        # NEW ATR-NORMALIZED EMA20 DISTANCE
+        "ema20_distance_atr": ema20_distance_atr,
 
         "atr": c_atr,
 
@@ -1274,6 +1326,15 @@ def select_ignition_targets(
 
 # ================================================================
 # LIVE BINANCE ORDER BOOK DEPTH
+#
+# IMPORTANT:
+# Order-book data is CONTEXT ONLY.
+#
+# It is NOT used to add points to BUY/SELL scores.
+# It is NOT required to trigger the Relief Scalp setup.
+#
+# This reduces dependence on potentially spoofable
+# instantaneous displayed liquidity.
 # ================================================================
 def fetch_order_book(
     symbol,
@@ -1386,6 +1447,11 @@ def fetch_order_book(
 
 # ================================================================
 # DIRECTIONAL PREDICTION ENGINE
+#
+# Order book remains available here as CONTEXT for the separate
+# manual direction report.
+#
+# It does NOT affect BUY/SELL alert scoring.
 # ================================================================
 def analyze_market_direction(
     c4,
@@ -1464,18 +1530,32 @@ def analyze_market_direction(
             "the daily trend is still weak"
         )
 
-    # Order book
+    # ------------------------------------------------------------
+    # ORDER BOOK — CONTEXT ONLY
+    #
+    # This does NOT contribute to BUY/SELL alert scores.
+    # It is retained in the manual direction report because the
+    # report is explicitly a broader market-context view.
+    # ------------------------------------------------------------
     if (
-        ob["bid_depth_1pct"]
-        > 1.2 * ob["ask_depth_1pct"]
+        ob["bid_depth_1pct"] > 0
+        and ob["ask_depth_1pct"] > 0
     ):
-        up_score += 1
+        if (
+            ob["bid_depth_1pct"]
+            > 1.2 * ob["ask_depth_1pct"]
+        ):
+            drivers.append(
+                "visible bid liquidity is currently stronger"
+            )
 
-    elif (
-        ob["ask_depth_1pct"]
-        > 1.2 * ob["bid_depth_1pct"]
-    ):
-        down_score += 1
+        elif (
+            ob["ask_depth_1pct"]
+            > 1.2 * ob["bid_depth_1pct"]
+        ):
+            drivers.append(
+                "visible sell liquidity is currently stronger"
+            )
 
     reason_str = (
         ", ".join(drivers[:2])
@@ -1588,7 +1668,8 @@ def evaluate_top_exhaustion(
         and (
             exit_score >= 45
             or c4["bearish_div"]
-            or c4["ema200_ext"] > 25.0
+            or c4["ema200_distance_atr"]
+            >= EXTREME_EMA200_DISTANCE_ATR
             or c4["rsi"] > 65
         )
     )
@@ -1649,7 +1730,8 @@ def evaluate_top_exhaustion(
     exhaustion_background = (
         exit_score >= 45
         or c4["rsi"] > 70
-        or c4["ema200_ext"] > 25.0
+        or c4["ema200_distance_atr"]
+        >= EXTREME_EMA200_DISTANCE_ATR
         or c4["bearish_div"]
     )
 
@@ -1675,7 +1757,7 @@ def evaluate_top_exhaustion(
 
 
 # ================================================================
-# NEW: BOTTOM EXHAUSTION / REVERSAL DETECTOR
+# BOTTOM EXHAUSTION / REVERSAL DETECTOR
 #
 # IMPORTANT:
 # This is completely independent from BUY scoring.
@@ -1712,14 +1794,12 @@ def evaluate_bottom_exhaustion(
 
     # ============================================================
     # BOTTOM BACKGROUND
-    #
-    # At least one meaningful reason that the market is
-    # potentially exhausted on the downside.
     # ============================================================
     bottom_background = (
         buy_score >= 45
         or c4["bullish_div"]
-        or c4["ema200_ext"] < -15.0
+        or c4["ema200_distance_atr"]
+        <= -EXTREME_EMA200_DISTANCE_ATR
         or c4["rsi"] < 35.0
     )
 
@@ -1763,9 +1843,6 @@ def evaluate_bottom_exhaustion(
 
     # ============================================================
     # STAGE 3 — CONFIRMED BOTTOM REVERSAL
-    #
-    # This requires actual EMA20 reclaim plus momentum/candle
-    # confirmation and meaningful bottom background.
     # ============================================================
     reversal_confirmation = (
         c4["crossed_above_ema20"]
@@ -1775,7 +1852,8 @@ def evaluate_bottom_exhaustion(
         and (
             buy_score >= 45
             or c4["bullish_div"]
-            or c4["ema200_ext"] < -15.0
+            or c4["ema200_distance_atr"]
+            <= -EXTREME_EMA200_DISTANCE_ATR
             or c4["rsi"] < 35.0
         )
     )
@@ -1800,8 +1878,6 @@ def evaluate_bottom_exhaustion(
 
     # ============================================================
     # STAGE 2 — DEVELOPING BOTTOM EXHAUSTION
-    #
-    # Require at least TWO independent signals.
     # ============================================================
     if improvement_count >= 2:
         return {
@@ -1811,8 +1887,6 @@ def evaluate_bottom_exhaustion(
 
     # ============================================================
     # STAGE 1 — SELLING PRESSURE EASING
-    #
-    # At least one improvement signal.
     # ============================================================
     if improvement_count >= 1:
         return {
@@ -1836,29 +1910,34 @@ def evaluate_market_condition(
 
     ema20 = c4["ema20"]
 
-    ema_stretch_20 = (
-        (
-            (p - ema20)
-            / ema20
-        ) * 100
-        if ema20 != 0
-        else 0
-    )
+    # ============================================================
+    # ATR-NORMALIZED EMA20 STRETCH
+    #
+    # Negative = below EMA20
+    # Positive = above EMA20
+    #
+    # This replaces the previous fixed -7.5% condition.
+    # ============================================================
+    ema20_distance_atr = c4["ema20_distance_atr"]
 
     active_setups = []
 
     # ============================================================
     # 1. COUNTER-TREND RELIEF SCALP
+    #
+    # IMPORTANT CHANGE:
+    # The old fixed -7.5% EMA20 threshold is replaced by
+    # a 2.5 ATR stretch.
+    #
+    # The old order-book bid >= 1.5x ask requirement has also
+    # been removed. Visible order-book imbalance is too easy
+    # to manipulate to be a hard setup requirement.
     # ============================================================
     if (
         d1["is_bearish"]
-        and ema_stretch_20 <= -7.5
+        and ema20_distance_atr <= -RELIEF_EMA20_STRETCH_ATR
         and c4["rsi"] <= 28.0
         and c4["vol_ratio"] >= 2.2
-        and ob["bid_depth_1pct"] > 0
-        and ob["ask_depth_1pct"] > 0
-        and ob["bid_depth_1pct"]
-        >= 1.5 * ob["ask_depth_1pct"]
     ):
 
         tp1 = ema20
@@ -1881,7 +1960,17 @@ def evaluate_market_condition(
 
         active_setups.append({
             "type": "RELIEF_SCALP",
-            "ema_stretch": ema_stretch_20,
+            "ema_stretch": (
+                (
+                    (p - ema20)
+                    / ema20
+                ) * 100
+                if ema20 != 0
+                else 0
+            ),
+            "ema_stretch_atr": abs(
+                ema20_distance_atr
+            ),
             "tp1": tp1,
             "tp2": tp2,
             "stop": c4["low"] * 0.992
@@ -1975,12 +2064,21 @@ def evaluate_market_condition(
             "Price is close to the lowest major level in the 4H lookback."
         )
 
-    if c4["ema200_ext"] < -15.0:
+    # ============================================================
+    # ATR-NORMALIZED EMA200 EXTENSION
+    #
+    # The +10 score is unchanged.
+    # Only the definition of "extreme extension" changed.
+    # ============================================================
+    if (
+        c4["ema200_distance_atr"]
+        <= -EXTREME_EMA200_DISTANCE_ATR
+    ):
         buy_score += 10
 
         buy_factors.append(
-            f"Price is far below its normal long-term 4H trend "
-            f"({c4['ema200_ext']:+.1f}%)."
+            f"Price is deeply extended below its long-term 4H trend "
+            f"({c4['ema200_distance_atr']:.1f} ATR below EMA200)."
         )
 
     if c4["rsi"] < 30:
@@ -2020,12 +2118,20 @@ def evaluate_market_condition(
             "Price is close to the highest major level in the 4H lookback."
         )
 
-    if c4["ema200_ext"] > 25.0:
+    # ============================================================
+    # ATR-NORMALIZED EMA200 EXTENSION
+    #
+    # The +10 score is unchanged.
+    # ============================================================
+    if (
+        c4["ema200_distance_atr"]
+        >= EXTREME_EMA200_DISTANCE_ATR
+    ):
         exit_score += 10
 
         exit_factors.append(
-            f"Price is far above its normal long-term 4H trend "
-            f"({c4['ema200_ext']:+.1f}%)."
+            f"Price is deeply extended above its long-term 4H trend "
+            f"({c4['ema200_distance_atr']:.1f} ATR above EMA200)."
         )
 
     if c4["rsi"] > 70:
@@ -2050,28 +2156,22 @@ def evaluate_market_condition(
             "Sellers strongly rejected higher prices."
         )
 
-    # ------------------------------------------------------------
+    # ============================================================
     # ORDER BOOK
-    # ------------------------------------------------------------
-    if (
-        ob["bid_depth_1pct"]
-        > 1.3 * ob["ask_depth_1pct"]
-    ):
-        buy_score += 10
-
-        buy_factors.append(
-            "There are significantly more visible buy orders than sell orders."
-        )
-
-    if (
-        ob["ask_depth_1pct"]
-        > 1.3 * ob["bid_depth_1pct"]
-    ):
-        exit_score += 10
-
-        exit_factors.append(
-            "There are significantly more visible sell orders than buy orders."
-        )
+    #
+    # REMOVED FROM CORE BUY/SELL SCORING.
+    #
+    # Previously:
+    #   bid > 1.3x ask = +10 BUY
+    #   ask > 1.3x bid = +10 SELL
+    #
+    # Those points are intentionally gone because a single
+    # displayed order-book snapshot can be spoofed/cancelled.
+    #
+    # Order book remains available as context in alerts and the
+    # manual direction report, but it cannot manufacture a
+    # BUY_CONFIRMED / BUY_EARLY / top score.
+    # ============================================================
 
     # ------------------------------------------------------------
     # 1D BEARISH PENALTY
@@ -2139,9 +2239,8 @@ def evaluate_market_condition(
             )
 
     # ============================================================
-    # NEW: BOTTOM EXHAUSTION
+    # BOTTOM EXHAUSTION
     #
-    # IMPORTANT:
     # This does not modify buy_score.
     # ============================================================
     bottom_setup = evaluate_bottom_exhaustion(
@@ -2391,6 +2490,9 @@ def check_4h_market():
                         f"{abs(setup['ema_stretch']):.1f}% "
                         f"below the 4H 20-EMA\n"
 
+                        f"• 📏 *EMA20 Distance:* "
+                        f"{setup['ema_stretch_atr']:.1f} ATR\n"
+
                         f"• ⚡ *RSI:* "
                         f"{c4['rsi']:.1f}\n"
 
@@ -2398,11 +2500,10 @@ def check_4h_market():
                         f"{c4['vol_ratio']:.1f}x normal\n\n"
 
                         "*Why the bot flagged this:*\n"
-                        "• Price has fallen unusually far.\n"
+                        "• Price has fallen unusually far relative to this coin's normal 4H movement.\n"
                         "• Sellers may be exhausted.\n"
-                        "• Buyers are showing stronger support.\n"
-                        "• The daily trend is still weak, so this is "
-                        "a bounce setup rather than a confirmed long-term reversal.\n\n"
+                        "• Trading activity has become unusually strong.\n"
+                        "• The daily trend is still weak, so this is a bounce setup rather than a confirmed long-term reversal.\n\n"
 
                         "*Possible bounce levels:*\n"
 
@@ -2445,7 +2546,7 @@ def check_4h_market():
                         f"candles "
                         f"({c4['candles_below_ema20'] * 4}h)\n"
 
-                        f"• 🛡️ *Strongest Visible Buy Support:* "
+                        f"• 🛡️ *Visible Buy Support:* "
                         f"${support_str}\n\n"
 
                         "*Why the bot flagged this:*\n"
@@ -2514,7 +2615,7 @@ def check_4h_market():
                         f"• *4H Candle Close:* "
                         f"${completed_4h_str}\n"
 
-                        f"• 🛡️ *Strongest Visible Buy Support:* "
+                        f"• 🛡️ *Visible Buy Support:* "
                         f"${support_str}\n"
 
                         f"• 💧 *Visible Sell Orders Within 1%:* "
@@ -2553,7 +2654,7 @@ def check_4h_market():
                         f"• *4H Candle Close:* "
                         f"${completed_4h_str}\n"
 
-                        f"• 🎯 *Strongest Visible Sell Area:* "
+                        f"• 🎯 *Visible Sell Area:* "
                         f"${resist_str}\n"
 
                         f"• 💧 *Visible Buy Orders Within 1%:* "
@@ -2565,8 +2666,8 @@ def check_4h_market():
                         "*What this means:*\n"
                         "• Price has moved up very strongly.\n"
                         "• The move is becoming stretched.\n"
-                        "• Buyers are very aggressive, but that does NOT mean the rally is over.\n"
-                        "• Selling interest is appearing around the current price.\n\n"
+                        "• Visible order-book liquidity is shown only as context and is not used to create the alert.\n"
+                        "• This does NOT mean the rally is over.\n\n"
 
                         "*Why the bot flagged this:*\n"
                         "• "
@@ -2598,7 +2699,7 @@ def check_4h_market():
                         f"• *4H Candle Close:* "
                         f"${completed_4h_str}\n"
 
-                        f"• 🎯 *Strongest Visible Sell Area:* "
+                        f"• 🎯 *Visible Sell Area:* "
                         f"${resist_str}\n"
 
                         f"• ⚡ *4H RSI:* "
@@ -2687,7 +2788,7 @@ def check_4h_market():
                         f"• *4H Candle Close:* "
                         f"${completed_4h_str}\n"
 
-                        f"• 🛡️ *Strongest Visible Buy Support:* "
+                        f"• 🛡️ *Visible Buy Support:* "
                         f"${support_str}\n"
 
                         f"• ⚡ *4H RSI:* "
@@ -2730,7 +2831,7 @@ def check_4h_market():
                         f"• *4H Candle Close:* "
                         f"${completed_4h_str}\n"
 
-                        f"• 🛡️ *Strongest Visible Buy Support:* "
+                        f"• 🛡️ *Visible Buy Support:* "
                         f"${support_str}\n"
 
                         f"• ⚡ *4H RSI:* "
