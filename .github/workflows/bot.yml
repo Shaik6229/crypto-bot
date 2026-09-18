@@ -1,7 +1,13 @@
 name: Crypto Liquidity Bot
 
 on:
-  workflow_dispatch: # Allows Cron-Job.org/API or manual trigger anytime
+  workflow_dispatch:
+    inputs:
+      run_mode:
+        description: "Execution mode"
+        required: false
+        default: "manual"
+        type: string
 
 jobs:
   run-bot:
@@ -23,5 +29,5 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-          BOT_RUN_MODE: schedule
+          BOT_RUN_MODE: ${{ inputs.run_mode }}
         run: python bot.py
