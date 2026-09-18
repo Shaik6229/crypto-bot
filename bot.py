@@ -199,16 +199,46 @@ def fetch_4h_data(symbol, limit=500):
     c_rsi, c_hist, c_atr = rsi_series[idx], macd_hist[idx], atr[idx]
     prev_hist = macd_hist[idx - 1]
 
-    prior_lows, prior_highs = lows[:idx], highs[:idx]
-    struct_low = min(prior_lows) if prior_lows else c_low
-    struct_high = max(prior_highs) if prior_highs else c_high
-    s_low_idx = prior_lows.index(struct_low) if prior_lows else 0
-    s_high_idx = prior_highs.index(struct_high) if prior_highs else 0
+    # Recent structural map: use confirmed 4H swing points from the
+    # recent market structure instead of the absolute highest high in
+    # the entire 500-candle dataset. This prevents an old, distant high
+    # from becoming an unrealistic TP2.
+    structure_lookback = min(120, idx)
+    structure_start = max(0, idx - structure_lookback)
 
-    local_lows = [(i, lows[i]) for i in range(5, idx - 5) if lows[i] == min(lows[i - 5:i + 6])]
-    local_highs = [(i, highs[i]) for i in range(5, idx - 5) if highs[i] == max(highs[i - 5:i + 6])]
-    r_low_idx, r_low = local_lows[-1] if local_lows else (s_low_idx, struct_low)
-    r_high_idx, r_high = local_highs[-1] if local_highs else (s_high_idx, struct_high)
+    prior_lows, prior_highs = lows[:idx], highs[:idx]
+    recent_highs = highs[structure_start:idx]
+    recent_lows = lows[structure_start:idx]
+
+    # Confirmed swing points require 5 candles on each side. Because the
+    # right-side candles are already closed historical candles, this does
+    # not use future/unclosed data.
+    local_lows = [(i, lows[i]) for i in range(max(5, structure_start), idx - 5)
+                  if lows[i] == min(lows[i - 5:i + 6])]
+    local_highs = [(i, highs[i]) for i in range(max(5, structure_start), idx - 5)
+                   if highs[i] == max(highs[i - 5:i + 6])]
+
+    if local_highs:
+        # Most recent confirmed swing is used for divergence; the highest
+        # recent confirmed swing is used as the structural resistance.
+        r_high_idx, r_high = local_highs[-1]
+        structural_swing_idx, structural_swing_high = max(local_highs, key=lambda x: x[1])
+        struct_high = structural_swing_high
+        s_high_idx = structural_swing_idx
+    else:
+        struct_high = max(recent_highs) if recent_highs else c_high
+        s_high_idx = (structure_start + recent_highs.index(struct_high)) if recent_highs else idx
+        r_high_idx, r_high = s_high_idx, struct_high
+
+    if local_lows:
+        r_low_idx, r_low = local_lows[-1]
+        structural_swing_low_idx, structural_swing_low = min(local_lows, key=lambda x: x[1])
+        struct_low = structural_swing_low
+        s_low_idx = structural_swing_low_idx
+    else:
+        struct_low = min(recent_lows) if recent_lows else c_low
+        s_low_idx = (structure_start + recent_lows.index(struct_low)) if recent_lows else idx
+        r_low_idx, r_low = s_low_idx, struct_low
 
     vol_median = statistics.median(volumes[max(0, idx - 20):idx]) if volumes[max(0, idx - 20):idx] else 1.0
     candle_range = c_high - c_low
@@ -235,6 +265,70 @@ def fetch_4h_data(symbol, limit=500):
         "ema200_ext": ((c_close - ema200[idx]) / ema200[idx]) * 100,
         "atr": c_atr, "candles_below_ema20": candles_below_ema20, "consolidation_high": consolidation_high
     }
+
+# --- TARGET SELECTION ENGINE ---
+def select_ignition_targets(c4):
+    """
+    Select TP1/TP2 from relevant resistance rather than the absolute
+    500-candle high. Technical calculations remain anchored to the
+    completed 4H candle.
+    """
+    p = c4["price"]
+    atr = c4["atr"]
+    if atr <= 0:
+        atr = p * 0.03
+
+    candidates = []
+
+    def add_candidate(price, level_type, priority):
+        if price is not None and price > p * 1.005:
+            candidates.append({"price": price, "type": level_type, "priority": priority})
+
+    add_candidate(c4["ema50"], "4H 50-EMA", 1)
+    add_candidate(c4["consolidation_high"], "Consolidation Resistance", 2)
+    add_candidate(c4["structural_high"], "Recent 4H Swing Resistance", 3)
+
+    candidates.sort(key=lambda x: (x["price"], x["priority"]))
+
+    # TP1: nearest meaningful resistance, but avoid a target that is too
+    # close to entry to justify a tactical trade.
+    min_tp1 = p + 0.75 * atr
+    tp1_candidates = [x for x in candidates if x["price"] >= min_tp1]
+    tp1_info = tp1_candidates[0] if tp1_candidates else {
+        "price": p + atr, "type": "1.0 ATR Projection", "priority": 99
+    }
+    tp1 = tp1_info["price"]
+
+    # TP2: next meaningful resistance at least 1 ATR beyond TP1.
+    min_tp2 = tp1 + atr
+    tp2_candidates = [x for x in candidates if x["price"] >= min_tp2]
+    tp2_info = tp2_candidates[0] if tp2_candidates else {
+        "price": p + 2.5 * atr, "type": "2.5 ATR Projection", "priority": 100
+    }
+    tp2 = tp2_info["price"]
+
+    if tp2 <= tp1:
+        tp2 = tp1 + atr
+        tp2_info = {"price": tp2, "type": "1 ATR Extension", "priority": 101}
+
+    # Hard cap prevents an ancient/distant level from creating an
+    # unrealistic target.
+    max_tp2 = p + 5.0 * atr
+    if tp2 > max_tp2:
+        tp2 = max_tp2
+        tp2_info = {"price": tp2, "type": "5 ATR Maximum Extension", "priority": 102}
+
+    return {
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp1_type": tp1_info["type"],
+        "tp2_type": tp2_info["type"],
+        "tp1_pct": ((tp1 - p) / p) * 100,
+        "tp2_pct": ((tp2 - p) / p) * 100,
+        "tp1_atr": (tp1 - p) / atr,
+        "tp2_atr": (tp2 - p) / atr
+    }
+
 
 # --- LIVE BINANCE ORDER BOOK DEPTH ---
 def fetch_order_book(symbol, current_price):
@@ -372,13 +466,20 @@ def evaluate_market_condition(c4, ob, d1):
         (c4["bullish_candle"] and c4["upper_wick"] <= 0.25) and 
         (c4["macd_hist_crossed_positive"] or c4["hist_slope_up"])):
         
-        tp1 = c4["ema50"] if c4["ema50"] > p else p * 1.06
-        tp2 = c4["structural_high"] if c4["structural_high"] > p else p * 1.12
+        targets = select_ignition_targets(c4)
+        tp1 = targets["tp1"]
+        tp2 = targets["tp2"]
         
         active_setups.append({
             "type": "ACCUMULATION_IGNITION",
             "tp1": tp1,
             "tp2": tp2,
+            "tp1_type": targets["tp1_type"],
+            "tp2_type": targets["tp2_type"],
+            "tp1_pct": targets["tp1_pct"],
+            "tp2_pct": targets["tp2_pct"],
+            "tp1_atr": targets["tp1_atr"],
+            "tp2_atr": targets["tp2_atr"],
             "stop": min(c4["low"], p * 0.96),
             "reasons": [
                 f"Breakout after {c4['candles_below_ema20']} candles compressed below 4H 20-EMA.",
@@ -513,8 +614,10 @@ def check_4h_market():
                         f"• 🛡️ *Largest Visible Bid Wall:* ${support_str}\n\n"
                         f"*Why the bot flagged this:*\n• " + "\n• ".join(setup["reasons"]) + "\n\n"
                         f"*Tactical Plan:*\n"
-                        f"• 🎯 *Take Profit 1 (50%):* ${format_price(setup['tp1'])}\n"
-                        f"• 🎯 *Take Profit 2 (50%):* ${format_price(setup['tp2'])}\n"
+                        f"• 🎯 *Take Profit 1 (50%):* ${format_price(setup['tp1'])} "
+                        f"({setup['tp1_type']} | +{setup['tp1_pct']:.1f}% | {setup['tp1_atr']:.1f} ATR)\n"
+                        f"• 🎯 *Take Profit 2 (50%):* ${format_price(setup['tp2'])} "
+                        f"({setup['tp2_type']} | +{setup['tp2_pct']:.1f}% | {setup['tp2_atr']:.1f} ATR)\n"
                         f"• 🛑 *Invalidation Stop:* Clean 4H close below ${format_price(setup['stop'])}\n\n"
                         f"📍 *Execution Rule:* Scale into spot at market or on 20-EMA retest."
                     )
