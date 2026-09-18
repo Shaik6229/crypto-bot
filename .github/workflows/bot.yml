@@ -2,12 +2,6 @@ name: Crypto Liquidity Bot
 
 on:
   workflow_dispatch:
-    inputs:
-      run_mode:
-        description: "Execution mode"
-        required: false
-        default: "manual"
-        type: string
 
 jobs:
   run-bot:
@@ -29,5 +23,5 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-          BOT_RUN_MODE: ${{ github.event.inputs.run_mode || 'manual' }}
+          BOT_RUN_MODE: manual
         run: python bot.py
