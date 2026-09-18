@@ -1,15 +1,12 @@
 name: Crypto Liquidity Bot
 
 on:
-  schedule:
-    # Runs at 5 minutes past every 4th hour (00:05, 04:05, 08:05 UTC, etc.)
-    # This avoids the GitHub server traffic jam and ensures the 4H candle is fully closed.
-    - cron: '5 */4 * * *'
-  workflow_dispatch: # Allows manual trigger anytime
+  workflow_dispatch: # Allows Cron-Job.org/API or manual trigger anytime
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -26,4 +23,5 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
+          BOT_RUN_MODE: schedule
         run: python bot.py
