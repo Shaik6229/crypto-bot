@@ -59,7 +59,7 @@ L1_L2_UNIVERSE = [
 AI_UNIVERSE = [
     "TAOUSDT", "RENDERUSDT", "GRTUSDT", "THETAUSDT", "AKTUSDT",
     "ARKMUSDT", "GLMUSDT", "RLCUSDT", "IOUSDT", "JASMYUSDT",
-    "IQUSDT", "NMRUSDT", "PHBUSDT", "TRACUSDT", "PHAUSDT"
+    "IQUSDT", "NMRUSDT", "PHBUSDT", "TRACUSDT",
 ]
 
 
@@ -953,12 +953,19 @@ def fetch_4h_data(symbol, limit=500):
         c_close < c_open
     )
 
-    # Rejection remains a completed-candle property.
+    # Rejection is deliberately stricter than simply having a bullish or
+    # bearish candle.  This prevents ordinary trend candles from being
+    # mislabeled as rejection and then feeding the exhaustion engines.
     bearish_rejection = (
         upper_wick_ratio >= 0.25
         or (
             bearish_candle
+            and upper_wick_ratio >= 0.10
             and c_close < prev_close
+            and c_close <= (
+                c_low
+                + candle_range * 0.45
+            )
         )
     )
 
@@ -966,6 +973,7 @@ def fetch_4h_data(symbol, limit=500):
         upper_wick_ratio >= 0.35
         or (
             bearish_candle
+            and upper_wick_ratio >= 0.15
             and c_close < prev_close
             and c_close <= (
                 c_low
@@ -978,7 +986,12 @@ def fetch_4h_data(symbol, limit=500):
         lower_wick_ratio >= 0.25
         or (
             bullish_candle
+            and lower_wick_ratio >= 0.10
             and c_close > prev_close
+            and c_close >= (
+                c_low
+                + candle_range * 0.55
+            )
         )
     )
 
@@ -986,6 +999,7 @@ def fetch_4h_data(symbol, limit=500):
         lower_wick_ratio >= 0.35
         or (
             bullish_candle
+            and lower_wick_ratio >= 0.15
             and c_close > prev_close
             and c_close >= (
                 c_low
@@ -1305,19 +1319,20 @@ def select_resistance_targets(
     reference_price=None
 ):
     """
-    Select up to three spot-profit-taking targets from meaningful
-    resistance above the reference price.
+    Select up to three ordered spot-profit-taking targets.
 
-    Resistance sources:
-      - 4H 50-EMA
-      - 4H 200-EMA
-      - pre-breakout consolidation high
-      - confirmed 4H swing highs
+    Target rules:
+      - resistance sources are clustered as before;
+      - TP1 is the nearest meaningful resistance, but never beyond 3 ATR;
+      - TP2 is the next meaningful resistance, but never beyond 4 ATR;
+      - TP3 is the next meaningful resistance, but never beyond 5 ATR;
+      - ATR fallbacks fill missing levels;
+      - final output is always ordered TP1 < TP2 < TP3 whenever the market
+        has enough room inside the 5-ATR ceiling.
 
-    Nearby references are clustered. ATR fallbacks are used only when
-    historical resistance is insufficient. Targets are capped at 5 ATR
-    so a single distant historical level cannot create an impractical
-    target.
+    The 3/4/5 ATR slot ceilings prevent a distant historical resistance from
+    becoming TP1 and then forcing TP2/TP3 backwards when the practical 5-ATR
+    cap is applied.
     """
     p = (
         float(reference_price)
@@ -1329,6 +1344,15 @@ def select_resistance_targets(
     if atr <= 0:
         atr = max(p * 0.03, 1e-12)
 
+    min_gap = max(
+        0.25 * atr,
+        p * 0.0025
+    )
+
+    max_tp1 = p + 3.0 * atr
+    max_tp2 = p + 4.0 * atr
+    max_tp3 = p + 5.0 * atr
+
     candidates = []
 
     def add_candidate(price, level_type, base_score, index=None):
@@ -1337,7 +1361,6 @@ def select_resistance_targets(
 
         price = float(price)
 
-        # Ignore levels that are effectively at/inside the current price.
         if price <= p * 1.003:
             return
 
@@ -1365,28 +1388,15 @@ def select_resistance_targets(
             "index": index
         })
 
-    add_candidate(
-        c4.get("ema50"),
-        "4H 50-EMA",
-        3.0
-    )
-
-    add_candidate(
-        c4.get("ema200"),
-        "4H 200-EMA",
-        3.0
-    )
-
+    add_candidate(c4.get("ema50"), "4H 50-EMA", 3.0)
+    add_candidate(c4.get("ema200"), "4H 200-EMA", 3.0)
     add_candidate(
         c4.get("consolidation_high"),
         "12-Candle Consolidation Resistance",
         4.0
     )
 
-    for index, price in c4.get(
-        "recent_swing_highs",
-        []
-    ):
+    for index, price in c4.get("recent_swing_highs", []):
         add_candidate(
             price,
             "Confirmed 4H Swing Resistance",
@@ -1394,301 +1404,219 @@ def select_resistance_targets(
             index
         )
 
-    def make_fallback(distance_atr, name):
-        price = p + distance_atr * atr
+    def make_info(price, name, score=0.0):
         return {
-            "price": price,
-            "score": 0.0,
+            "price": float(price),
+            "score": float(score),
             "types": [name],
-            "distance_atr": distance_atr,
+            "distance_atr": (float(price) - p) / atr,
             "distance_pct": (
-                ((price - p) / p) * 100
-                if p
-                else 0.0
+                ((float(price) - p) / p) * 100
+                if p else 0.0
             )
         }
 
-    if not candidates:
-        tp1_info = make_fallback(1.0, "1.0 ATR Projection")
-        tp2_info = make_fallback(2.5, "2.5 ATR Projection")
-        tp3_info = make_fallback(4.0, "4.0 ATR Projection")
+    if candidates:
+        cluster_tolerance = max(
+            0.30 * atr,
+            p * 0.003
+        )
 
-        return {
-            "tp1": tp1_info["price"],
-            "tp2": tp2_info["price"],
-            "tp3": tp3_info["price"],
-            "tp1_type": tp1_info["types"][0],
-            "tp2_type": tp2_info["types"][0],
-            "tp3_type": tp3_info["types"][0],
-            "tp1_pct": tp1_info["distance_pct"],
-            "tp2_pct": tp2_info["distance_pct"],
-            "tp3_pct": tp3_info["distance_pct"],
-            "tp1_atr": tp1_info["distance_atr"],
-            "tp2_atr": tp2_info["distance_atr"],
-            "tp3_atr": tp3_info["distance_atr"],
-            "tp1_score": 0,
-            "tp2_score": 0,
-            "tp3_score": 0,
-        }
+        candidates.sort(key=lambda x: x["price"])
+        clusters = []
 
-    # ------------------------------------------------------------
-    # CLUSTER RESISTANCE
-    # ------------------------------------------------------------
-    cluster_tolerance = max(
-        0.30 * atr,
-        p * 0.003
-    )
+        for candidate in candidates:
+            placed = False
 
-    candidates.sort(
-        key=lambda x: x["price"]
-    )
+            for cluster in clusters:
+                cluster_price = (
+                    sum(x["price"] for x in cluster)
+                    / len(cluster)
+                )
 
-    clusters = []
+                if abs(candidate["price"] - cluster_price) <= cluster_tolerance:
+                    cluster.append(candidate)
+                    placed = True
+                    break
 
-    for candidate in candidates:
-        placed = False
+            if not placed:
+                clusters.append([candidate])
+
+        resistance_levels = []
 
         for cluster in clusters:
             cluster_price = (
-                sum(
-                    x["price"]
-                    for x in cluster
-                )
+                sum(x["price"] for x in cluster)
                 / len(cluster)
             )
 
-            if abs(
-                candidate["price"]
-                - cluster_price
-            ) <= cluster_tolerance:
-                cluster.append(candidate)
-                placed = True
-                break
+            score = sum(x["score"] for x in cluster)
 
-        if not placed:
-            clusters.append([candidate])
+            if len(cluster) >= 2:
+                score += 2.0
+            if len(cluster) >= 3:
+                score += 2.0
 
-    resistance_levels = []
+            types = list(dict.fromkeys(x["type"] for x in cluster))
 
-    for cluster in clusters:
-        cluster_price = (
-            sum(
-                x["price"]
-                for x in cluster
+            resistance_levels.append({
+                "price": cluster_price,
+                "score": score,
+                "types": types,
+                "members": cluster
+            })
+
+        resistance_levels.sort(key=lambda x: x["price"])
+
+        meaningful = []
+
+        for level in resistance_levels:
+            distance_atr = (level["price"] - p) / atr
+            distance_pct = (
+                ((level["price"] - p) / p) * 100
+                if p else 0.0
             )
-            / len(cluster)
-        )
 
-        score = sum(
-            x["score"]
-            for x in cluster
-        )
+            if distance_atr < 0.50 and level["score"] < 8:
+                continue
 
-        if len(cluster) >= 2:
-            score += 2.0
-
-        if len(cluster) >= 3:
-            score += 2.0
-
-        types = list(
-            dict.fromkeys(
-                x["type"]
-                for x in cluster
-            )
-        )
-
-        resistance_levels.append({
-            "price": cluster_price,
-            "score": score,
-            "types": types,
-            "members": cluster
-        })
-
-    resistance_levels.sort(
-        key=lambda x: x["price"]
-    )
-
-    meaningful = []
-
-    for level in resistance_levels:
-        distance_atr = (
-            level["price"] - p
-        ) / atr
-
-        distance_pct = (
-            (
-                level["price"] - p
-            ) / p
-        ) * 100 if p else 0.0
-
-        # A level inside 0.5 ATR needs enough multi-source support
-        # to count as meaningful resistance.
-        if (
-            distance_atr < 0.50
-            and level["score"] < 8
-        ):
-            continue
-
-        meaningful.append({
-            **level,
-            "distance_atr": distance_atr,
-            "distance_pct": distance_pct
-        })
-
-    if not meaningful:
-        tp1_info = make_fallback(1.0, "1.0 ATR Projection")
+            meaningful.append({
+                **level,
+                "distance_atr": distance_atr,
+                "distance_pct": distance_pct
+            })
     else:
-        tp1_info = meaningful[0]
+        meaningful = []
+
+    # ------------------------------------------------------------
+    # TP1 — nearest meaningful resistance inside the TP1 band
+    # ------------------------------------------------------------
+    tp1_candidates = [
+        x for x in meaningful
+        if x["price"] <= max_tp1
+    ]
+
+    if tp1_candidates:
+        tp1_info = tp1_candidates[0]
+    else:
+        tp1_info = make_info(
+            p + 1.0 * atr,
+            "1.0 ATR Projection"
+        )
 
     tp1 = tp1_info["price"]
 
-    min_gap = max(
-        0.25 * atr,
-        p * 0.0025
-    )
-
+    # ------------------------------------------------------------
+    # TP2 — next resistance inside the TP2 band
+    # ------------------------------------------------------------
     tp2_candidates = [
-        x
-        for x in meaningful
-        if x["price"] > tp1 + min_gap
+        x for x in meaningful
+        if (
+            x["price"] > tp1 + min_gap
+            and x["price"] <= max_tp2
+        )
     ]
 
     if tp2_candidates:
         tp2_info = tp2_candidates[0]
     else:
-        tp2_info = make_fallback(2.5, "2.5 ATR Projection")
+        fallback_tp2 = max(
+            p + 2.5 * atr,
+            tp1 + min_gap
+        )
 
-        if tp2_info["price"] <= tp1:
-            tp2_info = {
-                "price": tp1 + 0.75 * atr,
-                "score": 0.0,
-                "types": ["0.75 ATR Beyond TP1"],
-                "distance_atr": (
-                    (tp1 + 0.75 * atr - p) / atr
-                ),
-                "distance_pct": (
-                    ((tp1 + 0.75 * atr - p) / p) * 100
-                    if p
-                    else 0.0
-                )
-            }
+        if fallback_tp2 > max_tp2:
+            fallback_tp2 = max_tp2
+
+        if fallback_tp2 <= tp1:
+            fallback_tp2 = min(
+                max_tp2,
+                tp1 + 0.25 * atr
+            )
+
+        tp2_info = make_info(
+            fallback_tp2,
+            "ATR / Ordered Fallback"
+        )
 
     tp2 = tp2_info["price"]
 
+    # ------------------------------------------------------------
+    # TP3 — next resistance inside the TP3 band
+    # ------------------------------------------------------------
     tp3_candidates = [
-        x
-        for x in meaningful
-        if x["price"] > tp2 + min_gap
+        x for x in meaningful
+        if (
+            x["price"] > tp2 + min_gap
+            and x["price"] <= max_tp3
+        )
     ]
 
     if tp3_candidates:
         tp3_info = tp3_candidates[0]
     else:
-        tp3_info = make_fallback(4.0, "4.0 ATR Projection")
-
-        if tp3_info["price"] <= tp2:
-            fallback_tp3 = tp2 + 0.75 * atr
-            tp3_info = {
-                "price": fallback_tp3,
-                "score": 0.0,
-                "types": ["0.75 ATR Beyond TP2"],
-                "distance_atr": (
-                    (fallback_tp3 - p) / atr
-                ),
-                "distance_pct": (
-                    ((fallback_tp3 - p) / p) * 100
-                    if p
-                    else 0.0
-                )
-            }
-
-    # Hard practical cap.
-    max_target = p + 5.0 * atr
-
-    if tp2 > max_target:
-        tp2 = max_target
-        tp2_info = {
-            "price": tp2,
-            "score": 0.0,
-            "types": ["5 ATR Maximum Extension"],
-            "distance_atr": 5.0,
-            "distance_pct": (
-                ((tp2 - p) / p) * 100
-                if p
-                else 0.0
-            )
-        }
-
-    if tp3_info["price"] > max_target:
-        tp3 = max_target
-        tp3_info = {
-            "price": tp3,
-            "score": 0.0,
-            "types": ["5 ATR Maximum Extension"],
-            "distance_atr": 5.0,
-            "distance_pct": (
-                ((tp3 - p) / p) * 100
-                if p
-                else 0.0
-            )
-        }
-    else:
-        tp3 = tp3_info["price"]
-
-    if tp3 <= tp2:
-        fallback_tp3 = min(
-            max_target,
-            tp2 + 0.50 * atr
+        fallback_tp3 = max(
+            p + 4.0 * atr,
+            tp2 + min_gap
         )
 
-        if fallback_tp3 > tp2:
-            tp3 = fallback_tp3
-            tp3_info = {
-                "price": tp3,
-                "score": 0.0,
-                "types": ["0.50 ATR Beyond TP2"],
-                "distance_atr": (
-                    (tp3 - p) / atr
-                ),
-                "distance_pct": (
-                    ((tp3 - p) / p) * 100
-                    if p
-                    else 0.0
-                )
-            }
-        else:
-            tp3 = tp2
+        if fallback_tp3 > max_tp3:
+            fallback_tp3 = max_tp3
+
+        if fallback_tp3 <= tp2:
+            # There is physically not enough room for another distinct
+            # target inside the 5-ATR ceiling.  Keep TP3 at the ceiling
+            # rather than ever moving it backward below TP2.
+            fallback_tp3 = max_tp3
+
+        tp3_info = make_info(
+            fallback_tp3,
+            "ATR / Ordered Fallback"
+        )
+
+    tp3 = tp3_info["price"]
+
+    # ------------------------------------------------------------
+    # Final safety normalization
+    # ------------------------------------------------------------
+    tp1 = min(tp1, max_tp1)
+    tp2 = min(tp2, max_tp2)
+    tp3 = min(tp3, max_tp3)
+
+    # Preserve ascending order wherever the 5-ATR ceiling permits it.
+    if tp2 <= tp1:
+        tp2 = min(
+            max_tp2,
+            tp1 + min_gap
+        )
+
+    if tp3 <= tp2:
+        tp3 = min(
+            max_tp3,
+            tp2 + min_gap
+        )
+
+    # Rebuild metadata after final normalization so displayed ATR/% values
+    # always match the actual returned prices.
+    if abs(tp1 - tp1_info["price"]) > 1e-12:
+        tp1_info = make_info(tp1, "ATR / Ordered Fallback")
+    if abs(tp2 - tp2_info["price"]) > 1e-12:
+        tp2_info = make_info(tp2, "ATR / Ordered Fallback")
+    if abs(tp3 - tp3_info["price"]) > 1e-12:
+        tp3_info = make_info(tp3, "ATR / Ordered Fallback")
 
     return {
         "tp1": tp1,
         "tp2": tp2,
         "tp3": tp3,
 
-        "tp1_type": " + ".join(
-            tp1_info["types"]
-        ),
-        "tp2_type": " + ".join(
-            tp2_info["types"]
-        ),
-        "tp3_type": " + ".join(
-            tp3_info["types"]
-        ),
+        "tp1_type": " + ".join(tp1_info["types"]),
+        "tp2_type": " + ".join(tp2_info["types"]),
+        "tp3_type": " + ".join(tp3_info["types"]),
 
-        "tp1_pct": (
-            ((tp1 - p) / p) * 100
-            if p
-            else 0.0
-        ),
-        "tp2_pct": (
-            ((tp2 - p) / p) * 100
-            if p
-            else 0.0
-        ),
-        "tp3_pct": (
-            ((tp3 - p) / p) * 100
-            if p
-            else 0.0
-        ),
+        "tp1_pct": ((tp1 - p) / p) * 100 if p else 0.0,
+        "tp2_pct": ((tp2 - p) / p) * 100 if p else 0.0,
+        "tp3_pct": ((tp3 - p) / p) * 100 if p else 0.0,
 
         "tp1_atr": (tp1 - p) / atr,
         "tp2_atr": (tp2 - p) / atr,
@@ -2753,13 +2681,13 @@ def evaluate_market_condition(
     # No bid/ask imbalance points are added here.
 
     # ------------------------------------------------------------
-    # 1D BEARISH PENALTY
+    # 1D BEARISH CONTEXT — INFORMATIONAL ONLY
     # ------------------------------------------------------------
-    if d1["is_bearish"]:
-        buy_score = max(
-            0,
-            buy_score - 25
-        )
+    # A bearish daily structure is deliberately NOT subtracted from the
+    # BUY score.  The bot is spot-only and must remain capable of detecting
+    # a bottom at the 4H level even while the higher timeframe is weak.
+    # The daily context is already available in the alert/manual report.
+    # This avoids turning the higher-timeframe view into a hard blocker.
 
     # ============================================================
     # BUY ALERTS
