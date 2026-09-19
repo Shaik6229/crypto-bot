@@ -2,6 +2,7 @@ import logging
 import os
 import time
 import statistics
+import traceback
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -484,7 +485,129 @@ def fetch_live_price(symbol):
 # ================================================================
 # 4H MARKET DATA FETCH
 # ================================================================
+
+
+# ================================================================
+# ADAPTIVE CONTEXT HELPERS
+# ================================================================
+VOLUME_BASELINE_PERIOD = 50
+IGNITION_VOLUME_RATIO_MIN = 1.60
+RELIEF_VOLUME_RATIO_MIN = 2.20
+IGNITION_VOLUME_PERCENTILE = 85.0
+RELIEF_VOLUME_PERCENTILE = 95.0
+
+LIQUIDITY_GOOD_SPREAD_PCT = 0.10
+LIQUIDITY_WIDE_SPREAD_PCT = 0.50
+
+
+def percentile_rank(
+    value,
+    series
+):
+    """Return the percentile rank of value within historical data."""
+    if not series:
+        return 50.0
+
+    less_equal = sum(
+        1
+        for x in series
+        if x <= value
+    )
+
+    return (
+        100.0
+        * less_equal
+        / len(series)
+    )
+
+
+def classify_volume_regime(
+    vol_ratio,
+    vol_percentile
+):
+    if (
+        vol_percentile >= 95.0
+        or vol_ratio >= 2.5
+    ):
+        return "exceptional"
+
+    if (
+        vol_percentile >= 80.0
+        or vol_ratio >= 1.5
+    ):
+        return "elevated"
+
+    if (
+        vol_percentile <= 20.0
+        or vol_ratio < 0.75
+    ):
+        return "quiet"
+
+    return "normal"
+
+
+def classify_compression(
+    candles_below_ema20
+):
+    if candles_below_ema20 >= 20:
+        return "extreme compression"
+
+    if candles_below_ema20 >= 15:
+        return "deep compression"
+
+    if candles_below_ema20 >= 10:
+        return "established compression"
+
+    if candles_below_ema20 >= 6:
+        return "developing compression"
+
+    return "limited compression"
+
+
+def liquidity_label(
+    spread_pct,
+    depth_ratio_pct
+):
+    """
+    Context label only.
+
+    It is deliberately not a BUY/SELL gate.
+    """
+    if (
+        spread_pct <= LIQUIDITY_GOOD_SPREAD_PCT
+        and depth_ratio_pct >= 5.0
+    ):
+        return "strong"
+
+    if (
+        spread_pct <= LIQUIDITY_WIDE_SPREAD_PCT
+        and depth_ratio_pct >= 1.0
+    ):
+        return "healthy"
+
+    if (
+        spread_pct > LIQUIDITY_WIDE_SPREAD_PCT
+        or depth_ratio_pct < 0.25
+    ):
+        return "thin"
+
+    return "mixed"
+
+
 def fetch_4h_data(symbol, limit=500):
+    """
+    Fetch completed 4H technical data.
+
+    Important:
+      - The last API candle is treated as live/incomplete and is NOT used
+        for completed-candle signals.
+      - Structural swing highs/lows require five candles on both sides,
+        so the current completed candle is never treated as a confirmed
+        swing.
+      - Divergence compares the two most recent CONFIRMED swing lows or
+        highs: price must make the new low/high while RSI makes the
+        opposite move.
+    """
     url = (
         "https://data-api.binance.vision/api/v3/klines"
         f"?symbol={symbol}&interval=4h&limit={limit}"
@@ -494,14 +617,13 @@ def fetch_4h_data(symbol, limit=500):
         url,
         timeout=10
     )
-
     res.raise_for_status()
 
     raw = res.json()
 
-    if len(raw) < 50:
+    if len(raw) < 60:
         raise ValueError(
-            f"Insufficient 4H candle data for {symbol}"
+            f"Insufficient 4H candle history for {symbol}: {len(raw)}"
         )
 
     opens = []
@@ -509,17 +631,25 @@ def fetch_4h_data(symbol, limit=500):
     lows = []
     closes = []
     volumes = []
+    quote_volumes = []
 
-    for c in raw:
-        opens.append(float(c[1]))
-        highs.append(float(c[2]))
-        lows.append(float(c[3]))
-        closes.append(float(c[4]))
-        volumes.append(float(c[5]))
+    for candle in raw:
+        opens.append(float(candle[1]))
+        highs.append(float(candle[2]))
+        lows.append(float(candle[3]))
+        closes.append(float(candle[4]))
+        volumes.append(float(candle[5]))
 
-    # ============================================================
-    # LAST COMPLETED 4H CANDLE
-    # ============================================================
+        # Binance kline field 7 = quote asset volume.
+        if len(candle) > 7:
+            quote_volumes.append(float(candle[7]))
+        else:
+            quote_volumes.append(
+                float(candle[4]) * float(candle[5])
+            )
+
+    # The final candle can still be forming. All signal calculations below
+    # intentionally anchor to the last completed candle.
     idx = len(closes) - 2
 
     rsi_series = calculate_wilder_rsi(
@@ -534,18 +664,15 @@ def fetch_4h_data(symbol, limit=500):
         closes,
         20
     )
-
     ema50 = calculate_ema(
         closes,
         50
     )
-
     ema200 = calculate_ema(
         closes,
         200
     )
-
-    atr = calculate_atr(
+    atr_series = calculate_atr(
         highs,
         lows,
         closes
@@ -556,52 +683,27 @@ def fetch_4h_data(symbol, limit=500):
     c_low = lows[idx]
     c_high = highs[idx]
 
-    c_rsi = rsi_series[idx]
-    c_hist = macd_hist[idx]
-    c_atr = atr[idx]
-
-    prev_hist = macd_hist[idx - 1]
-    prev_rsi = rsi_series[idx - 1]
-
     prev_close = closes[idx - 1]
     prev_open = opens[idx - 1]
-    prev_high = highs[idx - 1]
     prev_low = lows[idx - 1]
+    prev_high = highs[idx - 1]
 
-    # ============================================================
-    # ATR NORMALIZED DISTANCE FROM EMA200
-    #
-    # Positive = price above EMA200
-    # Negative = price below EMA200
-    #
-    # This replaces fixed +25% / -15% extension thresholds
-    # in the scoring and exhaustion engines.
-    # ============================================================
-    ema200_distance_atr = (
-        (
-            c_close - ema200[idx]
-        ) / c_atr
-        if c_atr > 0
-        else 0.0
-    )
+    c_rsi = rsi_series[idx]
+    prev_rsi = rsi_series[idx - 1]
 
-    # ============================================================
-    # ATR NORMALIZED DISTANCE FROM EMA20
-    #
-    # Positive = price above EMA20
-    # Negative = price below EMA20
-    # ============================================================
-    ema20_distance_atr = (
-        (
-            c_close - ema20[idx]
-        ) / c_atr
-        if c_atr > 0
-        else 0.0
-    )
+    c_hist = macd_hist[idx]
+    prev_hist = macd_hist[idx - 1]
 
-    # ============================================================
-    # ORIGINAL / FROZEN STRUCTURAL MAP
-    # ============================================================
+    c_atr = atr_series[idx]
+    if c_atr <= 0:
+        c_atr = max(
+            c_close * 0.01,
+            1e-12
+        )
+
+    # ------------------------------------------------------------
+    # STRUCTURAL EXTREMES
+    # ------------------------------------------------------------
     prior_lows = lows[:idx]
     prior_highs = highs[:idx]
 
@@ -617,61 +719,116 @@ def fetch_4h_data(symbol, limit=500):
         else c_high
     )
 
-    s_low_idx = (
-        prior_lows.index(struct_low)
-        if prior_lows
-        else 0
-    )
+    # ------------------------------------------------------------
+    # CONFIRMED SWING DETECTION
+    # ------------------------------------------------------------
+    # A swing at i is confirmed only when five candles to the LEFT and
+    # five candles to the RIGHT exist. Therefore the latest completed
+    # candle and all still-forming candles can never become a confirmed
+    # swing in this calculation.
+    swing_start = 5
+    swing_end = idx - 5
 
-    s_high_idx = (
-        prior_highs.index(struct_high)
-        if prior_highs
-        else 0
-    )
+    confirmed_swing_lows = []
+    confirmed_swing_highs = []
 
-    local_lows = [
-        (i, lows[i])
+    if swing_end > swing_start:
         for i in range(
-            5,
-            idx - 5
-        )
-        if lows[i] == min(
-            lows[i - 5:i + 6]
-        )
-    ]
+            swing_start,
+            swing_end
+        ):
+            low_window = lows[
+                i - 5:i + 6
+            ]
 
-    local_highs = [
-        (i, highs[i])
-        for i in range(
-            5,
-            idx - 5
-        )
-        if highs[i] == max(
-            highs[i - 5:i + 6]
-        )
-    ]
+            high_window = highs[
+                i - 5:i + 6
+            ]
 
-    r_low_idx, r_low = (
-        local_lows[-1]
-        if local_lows
-        else (
-            s_low_idx,
-            struct_low
-        )
-    )
+            if lows[i] == min(
+                low_window
+            ):
+                confirmed_swing_lows.append(
+                    (i, lows[i])
+                )
 
-    r_high_idx, r_high = (
-        local_highs[-1]
-        if local_highs
-        else (
-            s_high_idx,
-            struct_high
-        )
-    )
+            if highs[i] == max(
+                high_window
+            ):
+                confirmed_swing_highs.append(
+                    (i, highs[i])
+                )
 
-    # ============================================================
-    # RECENT TARGET RESISTANCE MAP
-    # ============================================================
+    # ------------------------------------------------------------
+    # CONFIRMED-SWING DIVERGENCE
+    # ------------------------------------------------------------
+    bullish_div = False
+    bearish_div = False
+
+    bullish_div_prev_index = None
+    bullish_div_current_index = None
+    bearish_div_prev_index = None
+    bearish_div_current_index = None
+
+    if len(confirmed_swing_lows) >= 2:
+        prev_low_idx, prev_low_price = (
+            confirmed_swing_lows[-2]
+        )
+        curr_low_idx, curr_low_price = (
+            confirmed_swing_lows[-1]
+        )
+
+        prev_low_rsi = rsi_series[
+            prev_low_idx
+        ]
+        curr_low_rsi = rsi_series[
+            curr_low_idx
+        ]
+
+        bullish_div = (
+            curr_low_price < prev_low_price
+            and curr_low_rsi > prev_low_rsi
+        )
+
+        if bullish_div:
+            bullish_div_prev_index = (
+                prev_low_idx
+            )
+            bullish_div_current_index = (
+                curr_low_idx
+            )
+
+    if len(confirmed_swing_highs) >= 2:
+        prev_high_idx, prev_high_price = (
+            confirmed_swing_highs[-2]
+        )
+        curr_high_idx, curr_high_price = (
+            confirmed_swing_highs[-1]
+        )
+
+        prev_high_rsi = rsi_series[
+            prev_high_idx
+        ]
+        curr_high_rsi = rsi_series[
+            curr_high_idx
+        ]
+
+        bearish_div = (
+            curr_high_price > prev_high_price
+            and curr_high_rsi < prev_high_rsi
+        )
+
+        if bearish_div:
+            bearish_div_prev_index = (
+                prev_high_idx
+            )
+            bearish_div_current_index = (
+                curr_high_idx
+            )
+
+    # ------------------------------------------------------------
+    # TARGET-ONLY RECENT RESISTANCE MAP
+    # ------------------------------------------------------------
     resistance_lookback = min(
         120,
         idx
@@ -697,28 +854,35 @@ def fetch_4h_data(symbol, limit=500):
         )
     ]
 
-    # ============================================================
+    # ------------------------------------------------------------
     # CONSOLIDATION RESISTANCE
-    # ============================================================
+    #
+    # IMPORTANT: current breakout candle is excluded.
+    # ------------------------------------------------------------
     consolidation_start = max(
         0,
         idx - 12
     )
 
-    consolidation_high = (
-        max(
+    if idx > consolidation_start:
+        consolidation_high = max(
             highs[
                 consolidation_start:idx
             ]
         )
-        if idx > 0
-        else c_high
-    )
+    else:
+        consolidation_high = c_high
 
-    # ============================================================
-    # VOLUME
-    # ============================================================
+    # ------------------------------------------------------------
+    # VOLUME CONTEXT
+    # ------------------------------------------------------------
+    volume_baseline_period = 50
+
     vol_window = volumes[
+        max(0, idx - volume_baseline_period):idx
+    ]
+
+    quote_volume_window = quote_volumes[
         max(0, idx - 20):idx
     ]
 
@@ -730,9 +894,35 @@ def fetch_4h_data(symbol, limit=500):
         else 1.0
     )
 
-    # ============================================================
+    current_volume = volumes[idx]
+
+    vol_ratio = (
+        current_volume / vol_median
+        if vol_median > 0
+        else 1.0
+    )
+
+    vol_percentile = percentile_rank(
+        current_volume,
+        vol_window
+    )
+
+    volume_regime = classify_volume_regime(
+        vol_ratio,
+        vol_percentile
+    )
+
+    avg_quote_volume_4h = (
+        statistics.median(
+            quote_volume_window
+        )
+        if quote_volume_window
+        else 0.0
+    )
+
+    # ------------------------------------------------------------
     # CANDLE STRUCTURE
-    # ============================================================
+    # ------------------------------------------------------------
     candle_range = (
         c_high - c_low
     )
@@ -743,7 +933,7 @@ def fetch_4h_data(symbol, limit=500):
             - c_low
         ) / candle_range
         if candle_range > 0
-        else 0
+        else 0.0
     )
 
     upper_wick_ratio = (
@@ -752,12 +942,145 @@ def fetch_4h_data(symbol, limit=500):
             - max(c_open, c_close)
         ) / candle_range
         if candle_range > 0
-        else 0
+        else 0.0
     )
 
-    # ============================================================
-    # CANDLES BELOW EMA20
-    # ============================================================
+    bullish_candle = (
+        c_close > c_open
+    )
+
+    bearish_candle = (
+        c_close < c_open
+    )
+
+    # Rejection remains a completed-candle property.
+    bearish_rejection = (
+        upper_wick_ratio >= 0.25
+        or (
+            bearish_candle
+            and c_close < prev_close
+        )
+    )
+
+    strong_bearish_rejection = (
+        upper_wick_ratio >= 0.35
+        or (
+            bearish_candle
+            and c_close < prev_close
+            and c_close <= (
+                c_low
+                + candle_range * 0.40
+            )
+        )
+    )
+
+    bullish_rejection = (
+        lower_wick_ratio >= 0.25
+        or (
+            bullish_candle
+            and c_close > prev_close
+        )
+    )
+
+    strong_bullish_rejection = (
+        lower_wick_ratio >= 0.35
+        or (
+            bullish_candle
+            and c_close > prev_close
+            and c_close >= (
+                c_low
+                + candle_range * 0.60
+            )
+        )
+    )
+
+    # ------------------------------------------------------------
+    # MOMENTUM / EMA STATE
+    # ------------------------------------------------------------
+    rsi_turning_down = (
+        c_rsi < prev_rsi
+    )
+
+    rsi_turning_up = (
+        c_rsi > prev_rsi
+    )
+
+    hist_slope_up = (
+        c_hist > prev_hist
+    )
+
+    hist_slope_down = (
+        c_hist < prev_hist
+    )
+
+    macd_hist_weakening = (
+        c_hist < prev_hist
+    )
+
+    macd_hist_strengthening = (
+        c_hist > prev_hist
+    )
+
+    macd_hist_crossed_positive = (
+        c_hist > 0
+        and prev_hist <= 0
+    )
+
+    macd_hist_crossed_negative = (
+        c_hist < 0
+        and prev_hist >= 0
+    )
+
+    prev_ema20 = ema20[
+        idx - 1
+    ]
+
+    above_ema20 = (
+        c_close > ema20[idx]
+    )
+
+    below_ema20 = (
+        c_close < ema20[idx]
+    )
+
+    crossed_above_ema20 = (
+        above_ema20
+        and prev_close <= prev_ema20
+    )
+
+    crossed_below_ema20 = (
+        below_ema20
+        and prev_close >= prev_ema20
+    )
+
+    ema20_distance_atr = (
+        (
+            c_close - ema20[idx]
+        ) / c_atr
+        if c_atr > 0
+        else 0.0
+    )
+
+    ema200_distance_atr = (
+        (
+            c_close - ema200[idx]
+        ) / c_atr
+        if c_atr > 0
+        else 0.0
+    )
+
+    ema200_ext_pct = (
+        (
+            (c_close - ema200[idx])
+            / ema200[idx]
+        ) * 100
+        if ema200[idx] != 0
+        else 0.0
+    )
+
+    # ------------------------------------------------------------
+    # COMPRESSION / SUPPRESSION
+    # ------------------------------------------------------------
     candles_below_ema20 = 0
 
     for i in range(
@@ -770,9 +1093,37 @@ def fetch_4h_data(symbol, limit=500):
         else:
             break
 
-    # ============================================================
-    # RETURN DATA
-    # ============================================================
+    compression_regime = classify_compression(
+        candles_below_ema20
+    )
+
+    # ------------------------------------------------------------
+    # LATEST CONFIRMED SWING REFERENCES
+    # ------------------------------------------------------------
+    latest_confirmed_low = (
+        confirmed_swing_lows[-1]
+        if confirmed_swing_lows
+        else None
+    )
+
+    previous_confirmed_low = (
+        confirmed_swing_lows[-2]
+        if len(confirmed_swing_lows) >= 2
+        else None
+    )
+
+    latest_confirmed_high = (
+        confirmed_swing_highs[-1]
+        if confirmed_swing_highs
+        else None
+    )
+
+    previous_confirmed_high = (
+        confirmed_swing_highs[-2]
+        if len(confirmed_swing_highs) >= 2
+        else None
+    )
+
     return {
         "price": c_close,
         "open": c_open,
@@ -803,6 +1154,43 @@ def fetch_4h_data(symbol, limit=500):
         ),
 
         "_idx": idx,
+        "closed_idx": idx,
+
+        # --------------------------------------------------------
+        # CONFIRMED STRUCTURE / DIVERGENCE
+        # --------------------------------------------------------
+        "confirmed_swing_lows": (
+            confirmed_swing_lows[-10:]
+        ),
+        "confirmed_swing_highs": (
+            confirmed_swing_highs[-10:]
+        ),
+        "latest_confirmed_low": (
+            latest_confirmed_low
+        ),
+        "previous_confirmed_low": (
+            previous_confirmed_low
+        ),
+        "latest_confirmed_high": (
+            latest_confirmed_high
+        ),
+        "previous_confirmed_high": (
+            previous_confirmed_high
+        ),
+        "bullish_div": bullish_div,
+        "bearish_div": bearish_div,
+        "bullish_div_prev_index": (
+            bullish_div_prev_index
+        ),
+        "bullish_div_current_index": (
+            bullish_div_current_index
+        ),
+        "bearish_div_prev_index": (
+            bearish_div_prev_index
+        ),
+        "bearish_div_current_index": (
+            bearish_div_current_index
+        ),
 
         # --------------------------------------------------------
         # MOMENTUM
@@ -811,112 +1199,59 @@ def fetch_4h_data(symbol, limit=500):
         "prev_rsi": prev_rsi,
 
         "rsi_turning_down": (
-            c_rsi < prev_rsi
+            rsi_turning_down
         ),
-
         "rsi_turning_up": (
-            c_rsi > prev_rsi
+            rsi_turning_up
         ),
 
-        "hist_slope_up": (
-            c_hist > prev_hist
-        ),
-
-        "hist_slope_down": (
-            c_hist < prev_hist
-        ),
+        "hist_slope_up": hist_slope_up,
+        "hist_slope_down": hist_slope_down,
 
         "macd_hist_weakening": (
-            c_hist < prev_hist
+            macd_hist_weakening
         ),
-
         "macd_hist_strengthening": (
-            c_hist > prev_hist
+            macd_hist_strengthening
         ),
-
         "macd_hist_crossed_positive": (
-            c_hist > 0
-            and prev_hist <= 0
+            macd_hist_crossed_positive
+        ),
+        "macd_hist_crossed_negative": (
+            macd_hist_crossed_negative
         ),
 
         # --------------------------------------------------------
-        # DIVERGENCE
+        # VOLUME
         # --------------------------------------------------------
-        "bullish_div": (
-            c_low <= r_low * 1.015
-            and c_rsi > rsi_series[r_low_idx]
-        ),
-
-        "bearish_div": (
-            c_high >= r_high * 0.985
-            and c_rsi < rsi_series[r_high_idx]
+        "vol_ratio": vol_ratio,
+        "vol_percentile": vol_percentile,
+        "volume_regime": volume_regime,
+        "avg_quote_volume_4h": (
+            avg_quote_volume_4h
         ),
 
         # --------------------------------------------------------
-        # VOLUME / CANDLE
+        # CANDLE
         # --------------------------------------------------------
-        "vol_ratio": (
-            volumes[idx] / vol_median
-            if vol_median > 0
-            else 1.0
-        ),
-
         "lower_wick": lower_wick_ratio,
-
         "upper_wick": upper_wick_ratio,
 
-        "bullish_candle": (
-            c_close > c_open
-        ),
+        "bullish_candle": bullish_candle,
+        "bearish_candle": bearish_candle,
 
-        "bearish_candle": (
-            c_close < c_open
-        ),
-
-        # --------------------------------------------------------
-        # TOP REVERSAL EVIDENCE
-        # --------------------------------------------------------
         "bearish_rejection": (
-            upper_wick_ratio >= 0.25
-            or (
-                c_close < c_open
-                and c_close < prev_close
-            )
+            bearish_rejection
         ),
-
         "strong_bearish_rejection": (
-            upper_wick_ratio >= 0.35
-            or (
-                c_close < c_open
-                and c_close < prev_close
-                and c_close <= (
-                    c_low
-                    + candle_range * 0.40
-                )
-            )
+            strong_bearish_rejection
         ),
 
-        # --------------------------------------------------------
-        # BOTTOM REVERSAL EVIDENCE
-        # --------------------------------------------------------
         "bullish_rejection": (
-            lower_wick_ratio >= 0.25
-            or (
-                c_close > c_open
-                and c_close > prev_close
-            )
+            bullish_rejection
         ),
-
         "strong_bullish_rejection": (
-            lower_wick_ratio >= 0.35
-            or (
-                c_close > c_open
-                and c_close > prev_close
-                and c_close >= (
-                    c_low
-                    + candle_range * 0.60
-                )
-            )
+            strong_bullish_rejection
         ),
 
         # --------------------------------------------------------
@@ -926,51 +1261,33 @@ def fetch_4h_data(symbol, limit=500):
         "ema50": ema50[idx],
         "ema200": ema200[idx],
 
-        "prev_ema20": ema20[idx - 1],
+        "prev_ema20": prev_ema20,
 
-        "below_ema20": (
-            c_close < ema20[idx]
-        ),
-
+        "below_ema20": below_ema20,
         "crossed_below_ema20": (
-            c_close < ema20[idx]
-            and prev_close >= ema20[idx - 1]
+            crossed_below_ema20
         ),
 
-        "above_ema20": (
-            c_close > ema20[idx]
-        ),
-
+        "above_ema20": above_ema20,
         "crossed_above_ema20": (
-            c_close > ema20[idx]
-            and prev_close <= ema20[idx - 1]
+            crossed_above_ema20
         ),
 
-        # --------------------------------------------------------
-        # ORIGINAL PERCENT EXTENSION — KEPT FOR DISPLAY/CONTEXT
-        #
-        # It is no longer used as the extreme EMA200 scoring
-        # threshold. ATR-normalized distance is used instead.
-        # --------------------------------------------------------
-        "ema200_ext": (
-            (
-                (c_close - ema200[idx])
-                / ema200[idx]
-            ) * 100
-            if ema200[idx] != 0
-            else 0
+        "ema200_ext": ema200_ext_pct,
+        "ema200_distance_atr": (
+            ema200_distance_atr
         ),
-
-        # NEW ATR-NORMALIZED EXTENSION
-        "ema200_distance_atr": ema200_distance_atr,
-
-        # NEW ATR-NORMALIZED EMA20 DISTANCE
-        "ema20_distance_atr": ema20_distance_atr,
+        "ema20_distance_atr": (
+            ema20_distance_atr
+        ),
 
         "atr": c_atr,
 
         "candles_below_ema20": (
             candles_below_ema20
+        ),
+        "compression_regime": (
+            compression_regime
         ),
 
         "consolidation_high": (
@@ -982,34 +1299,45 @@ def fetch_4h_data(symbol, limit=500):
 # ================================================================
 # RESISTANCE-BASED TARGET SELECTION ENGINE
 # ================================================================
+
 def select_resistance_targets(
     c4,
     reference_price=None
 ):
+    """
+    Select up to three spot-profit-taking targets from meaningful
+    resistance above the reference price.
+
+    Resistance sources:
+      - 4H 50-EMA
+      - 4H 200-EMA
+      - pre-breakout consolidation high
+      - confirmed 4H swing highs
+
+    Nearby references are clustered. ATR fallbacks are used only when
+    historical resistance is insufficient. Targets are capped at 5 ATR
+    so a single distant historical level cannot create an impractical
+    target.
+    """
     p = (
-        reference_price
+        float(reference_price)
         if reference_price is not None
-        else c4["price"]
+        else float(c4["price"])
     )
 
-    atr = c4["atr"]
-
+    atr = float(c4.get("atr", 0.0) or 0.0)
     if atr <= 0:
-        atr = p * 0.03
+        atr = max(p * 0.03, 1e-12)
 
     candidates = []
 
-    def add_candidate(
-        price,
-        level_type,
-        base_score,
-        index=None
-    ):
+    def add_candidate(price, level_type, base_score, index=None):
         if price is None:
             return
 
         price = float(price)
 
+        # Ignore levels that are effectively at/inside the current price.
         if price <= p * 1.003:
             return
 
@@ -1018,7 +1346,7 @@ def select_resistance_targets(
         if index is not None:
             age = max(
                 0,
-                c4["_idx"] - index
+                c4["_idx"] - int(index)
             )
 
             if age <= 24:
@@ -1033,34 +1361,28 @@ def select_resistance_targets(
         candidates.append({
             "price": price,
             "type": level_type,
-            "score": (
-                base_score
-                + recency_score
-            ),
+            "score": float(base_score) + recency_score,
             "index": index
         })
 
-    # EMA resistance
     add_candidate(
-        c4["ema50"],
+        c4.get("ema50"),
         "4H 50-EMA",
         3.0
     )
 
     add_candidate(
-        c4["ema200"],
+        c4.get("ema200"),
         "4H 200-EMA",
         3.0
     )
 
-    # Consolidation resistance
     add_candidate(
-        c4["consolidation_high"],
+        c4.get("consolidation_high"),
         "12-Candle Consolidation Resistance",
         4.0
     )
 
-    # Confirmed swing highs
     for index, price in c4.get(
         "recent_swing_highs",
         []
@@ -1072,26 +1394,46 @@ def select_resistance_targets(
             index
         )
 
-    if not candidates:
-        tp1 = p + atr
-        tp2 = p + 2.5 * atr
-
+    def make_fallback(distance_atr, name):
+        price = p + distance_atr * atr
         return {
-            "tp1": tp1,
-            "tp2": tp2,
-            "tp1_type": "1.0 ATR Projection",
-            "tp2_type": "2.5 ATR Projection",
-            "tp1_pct": ((tp1 - p) / p) * 100,
-            "tp2_pct": ((tp2 - p) / p) * 100,
-            "tp1_atr": (tp1 - p) / atr,
-            "tp2_atr": (tp2 - p) / atr,
-            "tp1_score": 0,
-            "tp2_score": 0
+            "price": price,
+            "score": 0.0,
+            "types": [name],
+            "distance_atr": distance_atr,
+            "distance_pct": (
+                ((price - p) / p) * 100
+                if p
+                else 0.0
+            )
         }
 
-    # ============================================================
+    if not candidates:
+        tp1_info = make_fallback(1.0, "1.0 ATR Projection")
+        tp2_info = make_fallback(2.5, "2.5 ATR Projection")
+        tp3_info = make_fallback(4.0, "4.0 ATR Projection")
+
+        return {
+            "tp1": tp1_info["price"],
+            "tp2": tp2_info["price"],
+            "tp3": tp3_info["price"],
+            "tp1_type": tp1_info["types"][0],
+            "tp2_type": tp2_info["types"][0],
+            "tp3_type": tp3_info["types"][0],
+            "tp1_pct": tp1_info["distance_pct"],
+            "tp2_pct": tp2_info["distance_pct"],
+            "tp3_pct": tp3_info["distance_pct"],
+            "tp1_atr": tp1_info["distance_atr"],
+            "tp2_atr": tp2_info["distance_atr"],
+            "tp3_atr": tp3_info["distance_atr"],
+            "tp1_score": 0,
+            "tp2_score": 0,
+            "tp3_score": 0,
+        }
+
+    # ------------------------------------------------------------
     # CLUSTER RESISTANCE
-    # ============================================================
+    # ------------------------------------------------------------
     cluster_tolerance = max(
         0.30 * atr,
         p * 0.003
@@ -1124,9 +1466,7 @@ def select_resistance_targets(
                 break
 
         if not placed:
-            clusters.append([
-                candidate
-            ])
+            clusters.append([candidate])
 
     resistance_levels = []
 
@@ -1179,8 +1519,10 @@ def select_resistance_targets(
             (
                 level["price"] - p
             ) / p
-        ) * 100
+        ) * 100 if p else 0.0
 
+        # A level inside 0.5 ATR needs enough multi-source support
+        # to count as meaningful resistance.
         if (
             distance_atr < 0.50
             and level["score"] < 8
@@ -1193,121 +1535,168 @@ def select_resistance_targets(
             "distance_pct": distance_pct
         })
 
-    # TP1
-    if meaningful:
-        tp1_info = meaningful[0]
+    if not meaningful:
+        tp1_info = make_fallback(1.0, "1.0 ATR Projection")
     else:
-        tp1_price = p + atr
-
-        tp1_info = {
-            "price": tp1_price,
-            "score": 0,
-            "types": [
-                "1.0 ATR Projection"
-            ],
-            "distance_atr": 1.0,
-            "distance_pct": (
-                (tp1_price - p) / p
-            ) * 100
-        }
+        tp1_info = meaningful[0]
 
     tp1 = tp1_info["price"]
 
-    # TP2
+    min_gap = max(
+        0.25 * atr,
+        p * 0.0025
+    )
+
     tp2_candidates = [
         x
         for x in meaningful
-        if x["price"] > (
-            tp1
-            + max(
-                0.25 * atr,
-                p * 0.0025
-            )
-        )
+        if x["price"] > tp1 + min_gap
     ]
 
     if tp2_candidates:
         tp2_info = tp2_candidates[0]
     else:
-        tp2_price = p + 2.5 * atr
+        tp2_info = make_fallback(2.5, "2.5 ATR Projection")
 
-        if tp2_price <= tp1:
-            tp2_price = (
-                tp1
-                + 0.75 * atr
-            )
-
-        tp2_info = {
-            "price": tp2_price,
-            "score": 0,
-            "types": [
-                "2.5 ATR Projection"
-            ],
-            "distance_atr": (
-                (tp2_price - p) / atr
-            ),
-            "distance_pct": (
-                (tp2_price - p) / p
-            ) * 100
-        }
+        if tp2_info["price"] <= tp1:
+            tp2_info = {
+                "price": tp1 + 0.75 * atr,
+                "score": 0.0,
+                "types": ["0.75 ATR Beyond TP1"],
+                "distance_atr": (
+                    (tp1 + 0.75 * atr - p) / atr
+                ),
+                "distance_pct": (
+                    ((tp1 + 0.75 * atr - p) / p) * 100
+                    if p
+                    else 0.0
+                )
+            }
 
     tp2 = tp2_info["price"]
 
-    # Hard maximum
-    max_tp2 = p + 5.0 * atr
+    tp3_candidates = [
+        x
+        for x in meaningful
+        if x["price"] > tp2 + min_gap
+    ]
 
-    if tp2 > max_tp2:
-        tp2 = max_tp2
+    if tp3_candidates:
+        tp3_info = tp3_candidates[0]
+    else:
+        tp3_info = make_fallback(4.0, "4.0 ATR Projection")
 
+        if tp3_info["price"] <= tp2:
+            fallback_tp3 = tp2 + 0.75 * atr
+            tp3_info = {
+                "price": fallback_tp3,
+                "score": 0.0,
+                "types": ["0.75 ATR Beyond TP2"],
+                "distance_atr": (
+                    (fallback_tp3 - p) / atr
+                ),
+                "distance_pct": (
+                    ((fallback_tp3 - p) / p) * 100
+                    if p
+                    else 0.0
+                )
+            }
+
+    # Hard practical cap.
+    max_target = p + 5.0 * atr
+
+    if tp2 > max_target:
+        tp2 = max_target
         tp2_info = {
             "price": tp2,
-            "score": 0,
-            "types": [
-                "5 ATR Maximum Extension"
-            ],
+            "score": 0.0,
+            "types": ["5 ATR Maximum Extension"],
             "distance_atr": 5.0,
             "distance_pct": (
-                (tp2 - p) / p
-            ) * 100
+                ((tp2 - p) / p) * 100
+                if p
+                else 0.0
+            )
         }
+
+    if tp3_info["price"] > max_target:
+        tp3 = max_target
+        tp3_info = {
+            "price": tp3,
+            "score": 0.0,
+            "types": ["5 ATR Maximum Extension"],
+            "distance_atr": 5.0,
+            "distance_pct": (
+                ((tp3 - p) / p) * 100
+                if p
+                else 0.0
+            )
+        }
+    else:
+        tp3 = tp3_info["price"]
+
+    if tp3 <= tp2:
+        fallback_tp3 = min(
+            max_target,
+            tp2 + 0.50 * atr
+        )
+
+        if fallback_tp3 > tp2:
+            tp3 = fallback_tp3
+            tp3_info = {
+                "price": tp3,
+                "score": 0.0,
+                "types": ["0.50 ATR Beyond TP2"],
+                "distance_atr": (
+                    (tp3 - p) / atr
+                ),
+                "distance_pct": (
+                    ((tp3 - p) / p) * 100
+                    if p
+                    else 0.0
+                )
+            }
+        else:
+            tp3 = tp2
 
     return {
         "tp1": tp1,
         "tp2": tp2,
+        "tp3": tp3,
 
         "tp1_type": " + ".join(
             tp1_info["types"]
         ),
-
         "tp2_type": " + ".join(
             tp2_info["types"]
+        ),
+        "tp3_type": " + ".join(
+            tp3_info["types"]
         ),
 
         "tp1_pct": (
             ((tp1 - p) / p) * 100
+            if p
+            else 0.0
         ),
-
         "tp2_pct": (
             ((tp2 - p) / p) * 100
+            if p
+            else 0.0
+        ),
+        "tp3_pct": (
+            ((tp3 - p) / p) * 100
+            if p
+            else 0.0
         ),
 
-        "tp1_atr": (
-            (tp1 - p) / atr
-        ),
+        "tp1_atr": (tp1 - p) / atr,
+        "tp2_atr": (tp2 - p) / atr,
+        "tp3_atr": (tp3 - p) / atr,
 
-        "tp2_atr": (
-            (tp2 - p) / atr
-        ),
-
-        "tp1_score": tp1_info.get(
-            "score",
-            0
-        ),
-
-        "tp2_score": tp2_info.get(
-            "score",
-            0
-        )
+        "tp1_score": tp1_info.get("score", 0),
+        "tp2_score": tp2_info.get("score", 0),
+        "tp3_score": tp3_info.get("score", 0),
     }
 
 
@@ -1336,10 +1725,19 @@ def select_ignition_targets(
 # This reduces dependence on potentially spoofable
 # instantaneous displayed liquidity.
 # ================================================================
+
 def fetch_order_book(
     symbol,
-    current_price
+    current_price,
+    reference_quote_volume=0.0
 ):
+    """
+    Fetch visible 1% depth for context.
+
+    The order book is intentionally not used as a hard BUY/SELL score input.
+    Visible depth is also normalized against recent quote volume so the
+    displayed liquidity can be interpreted across assets of different scale.
+    """
     try:
         url = (
             "https://data-api.binance.vision/api/v3/depth"
@@ -1356,16 +1754,16 @@ def fetch_order_book(
         raw = res.json()
 
         bids = [
-            [float(p), float(q)]
-            for p, q in raw.get(
+            [float(price), float(quantity)]
+            for price, quantity in raw.get(
                 "bids",
                 []
             )
         ]
 
         asks = [
-            [float(p), float(q)]
-            for p, q in raw.get(
+            [float(price), float(quantity)]
+            for price, quantity in raw.get(
                 "asks",
                 []
             )
@@ -1373,32 +1771,37 @@ def fetch_order_book(
 
         if not bids or not asks:
             return {
-                "bid_depth_1pct": 0,
-                "ask_depth_1pct": 0,
+                "bid_depth_1pct": 0.0,
+                "ask_depth_1pct": 0.0,
                 "bid_wall_price": current_price,
-                "ask_wall_price": current_price
+                "ask_wall_price": current_price,
+                "bid_wall_notional": 0.0,
+                "ask_wall_notional": 0.0,
+                "spread_pct": 0.0,
+                "visible_depth_ratio_pct": 0.0,
+                "liquidity_label": "unknown",
             }
 
         bids_1pct_levels = [
-            x
-            for x in bids
-            if x[0] >= current_price * 0.99
+            level
+            for level in bids
+            if level[0] >= current_price * 0.99
         ]
 
         asks_1pct_levels = [
-            x
-            for x in asks
-            if x[0] <= current_price * 1.01
+            level
+            for level in asks
+            if level[0] <= current_price * 1.01
         ]
 
         bid_depth = sum(
-            p * q
-            for p, q in bids_1pct_levels
+            price * quantity
+            for price, quantity in bids_1pct_levels
         )
 
         ask_depth = sum(
-            p * q
-            for p, q in asks_1pct_levels
+            price * quantity
+            for price, quantity in asks_1pct_levels
         )
 
         largest_bid = (
@@ -1409,7 +1812,7 @@ def fetch_order_book(
             if bids_1pct_levels
             else [
                 current_price,
-                0
+                0.0
             ]
         )
 
@@ -1421,15 +1824,70 @@ def fetch_order_book(
             if asks_1pct_levels
             else [
                 current_price,
-                0
+                0.0
             ]
+        )
+
+        best_bid = (
+            max(
+                price
+                for price, _ in bids
+            )
+            if bids
+            else current_price
+        )
+
+        best_ask = (
+            min(
+                price
+                for price, _ in asks
+            )
+            if asks
+            else current_price
+        )
+
+        spread_pct = (
+            (
+                (best_ask - best_bid)
+                / current_price
+            ) * 100
+            if current_price > 0
+            else 0.0
+        )
+
+        visible_depth = (
+            bid_depth
+            + ask_depth
+        )
+
+        depth_ratio_pct = (
+            (
+                visible_depth
+                / reference_quote_volume
+            ) * 100
+            if reference_quote_volume > 0
+            else 0.0
         )
 
         return {
             "bid_depth_1pct": bid_depth,
             "ask_depth_1pct": ask_depth,
             "bid_wall_price": largest_bid[0],
-            "ask_wall_price": largest_ask[0]
+            "ask_wall_price": largest_ask[0],
+            "bid_wall_notional": (
+                largest_bid[0]
+                * largest_bid[1]
+            ),
+            "ask_wall_notional": (
+                largest_ask[0]
+                * largest_ask[1]
+            ),
+            "spread_pct": spread_pct,
+            "visible_depth_ratio_pct": depth_ratio_pct,
+            "liquidity_label": liquidity_label(
+                spread_pct,
+                depth_ratio_pct
+            )
         }
 
     except Exception as e:
@@ -1438,10 +1896,15 @@ def fetch_order_book(
         )
 
         return {
-            "bid_depth_1pct": 0,
-            "ask_depth_1pct": 0,
+            "bid_depth_1pct": 0.0,
+            "ask_depth_1pct": 0.0,
             "bid_wall_price": current_price,
-            "ask_wall_price": current_price
+            "ask_wall_price": current_price,
+            "bid_wall_notional": 0.0,
+            "ask_wall_notional": 0.0,
+            "spread_pct": 0.0,
+            "visible_depth_ratio_pct": 0.0,
+            "liquidity_label": "unknown",
         }
 
 
@@ -1653,104 +2116,170 @@ def analyze_market_direction(
 # ================================================================
 # TOP EXHAUSTION / REVERSAL DETECTOR
 # ================================================================
+
 def evaluate_top_exhaustion(
-    c4,
-    exit_score
+    c4
 ):
-    # ============================================================
+    """
+    Three-stage top process built from price/momentum evidence only.
+
+    This engine is intentionally independent of SELL score and position
+    state, so an exit/top alert can occur even when no BUY alert was active.
+
+    Stage 1:
+        RALLY_OVERHEATING
+        - price/RSI/ATR extension shows a stretched rally
+
+    Stage 2:
+        TOP_EXHAUSTION_DEVELOPING
+        - the rally is stretched AND at least two independent deterioration
+          signals are present
+
+    Stage 3:
+        TOP_REVERSAL_CONFIRMED
+        - completed 4H candle crosses below EMA20 and momentum/rejection
+          evidence confirms actual deterioration
+    """
+    background_signals = []
+
+    if c4["rsi"] >= 70.0:
+        background_signals.append(
+            f"RSI is elevated at {c4['rsi']:.1f}."
+        )
+    elif c4["rsi"] >= 65.0:
+        background_signals.append(
+            f"RSI is elevated at {c4['rsi']:.1f}."
+        )
+
+    if (
+        c4["ema200_distance_atr"]
+        >= EXTREME_EMA200_DISTANCE_ATR
+    ):
+        background_signals.append(
+            f"Price is {c4['ema200_distance_atr']:.1f} ATR above EMA200."
+        )
+    elif c4["ema200_distance_atr"] >= 3.5:
+        background_signals.append(
+            f"Price is extended {c4['ema200_distance_atr']:.1f} ATR above EMA200."
+        )
+
+    if (
+        c4["structural_high"] - c4["price"]
+        <= 1.5 * c4["atr"]
+    ):
+        background_signals.append(
+            "Price is close to the major 4H structural high."
+        )
+
+    if c4["bearish_div"]:
+        background_signals.append(
+            "Bearish divergence is present between the two latest confirmed swing highs."
+        )
+
+    rally_background = bool(
+        background_signals
+    )
+
+    deterioration_signals = []
+    reasons = []
+
+    if c4["rsi_turning_down"]:
+        deterioration_signals.append(
+            "RSI is turning downward."
+        )
+        reasons.append(
+            f"RSI has started falling ({c4['prev_rsi']:.1f} → {c4['rsi']:.1f})."
+        )
+
+    if c4["macd_hist_weakening"]:
+        deterioration_signals.append(
+            "MACD histogram is weakening."
+        )
+        reasons.append(
+            "MACD histogram is losing upward momentum."
+        )
+
+    if c4["bearish_rejection"]:
+        deterioration_signals.append(
+            "Bearish candle/rejection is present."
+        )
+        reasons.append(
+            "The latest completed 4H candle shows rejection/selling near higher prices."
+        )
+
+    if c4["bearish_div"]:
+        deterioration_signals.append(
+            "Bearish divergence is present."
+        )
+        reasons.append(
+            "The two latest confirmed swing highs show higher price with lower RSI momentum."
+        )
+
+    deterioration_count = len(
+        deterioration_signals
+    )
+
+    # ------------------------------------------------------------
     # STAGE 3 — CONFIRMED REVERSAL
-    # ============================================================
+    # ------------------------------------------------------------
     reversal_confirmation = (
         c4["crossed_below_ema20"]
         and c4["rsi_turning_down"]
         and c4["macd_hist_weakening"]
         and c4["bearish_rejection"]
         and (
-            exit_score >= 45
-            or c4["bearish_div"]
+            c4["bearish_div"]
             or c4["ema200_distance_atr"]
             >= EXTREME_EMA200_DISTANCE_ATR
-            or c4["rsi"] > 65
+            or c4["rsi"] >= 70.0
         )
     )
 
     if reversal_confirmation:
-        reasons = [
-            "Price has closed back below the 4H 20-EMA.",
-            "Momentum is weakening instead of continuing upward.",
-            "RSI has started turning down.",
-            "The latest candle shows signs that sellers are taking control."
+        confirmed_reasons = [
+            "The completed 4H candle closed back below the 20-EMA.",
+            "RSI is turning downward.",
+            "MACD histogram is weakening.",
+            "The latest candle shows bearish rejection."
         ]
 
         if c4["bearish_div"]:
-            reasons.append(
-                "Price and momentum are no longer moving together."
+            confirmed_reasons.append(
+                "Bearish divergence is present between confirmed swing highs."
             )
 
         return {
             "type": "TOP_REVERSAL_CONFIRMED",
-            "reasons": reasons
+            "reasons": confirmed_reasons
         }
 
-    # ============================================================
+    # ------------------------------------------------------------
     # STAGE 2 — DEVELOPING EXHAUSTION
-    # ============================================================
-    deterioration_count = 0
-    reasons = []
-
-    if c4["rsi_turning_down"]:
-        deterioration_count += 1
-
-        reasons.append(
-            f"RSI has started falling "
-            f"({c4['prev_rsi']:.1f} → {c4['rsi']:.1f})."
-        )
-
-    if c4["macd_hist_weakening"]:
-        deterioration_count += 1
-
-        reasons.append(
-            "Momentum is starting to weaken."
-        )
-
-    if c4["bearish_rejection"]:
-        deterioration_count += 1
-
-        reasons.append(
-            "The latest candle shows selling/rejection near the top."
-        )
-
-    if c4["bearish_div"]:
-        deterioration_count += 1
-
-        reasons.append(
-            "Price is making a stronger push while momentum is weaker."
-        )
-
-    exhaustion_background = (
-        exit_score >= 45
-        or c4["rsi"] > 70
-        or c4["ema200_distance_atr"]
-        >= EXTREME_EMA200_DISTANCE_ATR
-        or c4["bearish_div"]
-    )
-
+    # ------------------------------------------------------------
     if (
-        exhaustion_background
+        rally_background
         and deterioration_count >= 2
     ):
+        if not reasons:
+            reasons = list(
+                background_signals
+            )
+
         return {
             "type": "TOP_EXHAUSTION_DEVELOPING",
-            "reasons": reasons
+            "reasons": (
+                background_signals
+                + reasons
+            )
         }
 
-    # ============================================================
+    # ------------------------------------------------------------
     # STAGE 1 — RALLY OVERHEATING
-    # ============================================================
-    if exit_score >= 45:
+    # ------------------------------------------------------------
+    if rally_background:
         return {
             "type": "RALLY_OVERHEATING",
-            "reasons": []
+            "reasons": background_signals
         }
 
     return None
@@ -1764,111 +2293,122 @@ def evaluate_top_exhaustion(
 #
 # Existing BUY score point values are NOT changed.
 # ================================================================
+
 def evaluate_bottom_exhaustion(
-    c4,
-    buy_score
+    c4
 ):
     """
-    Three-stage bottom framework.
+    Three-stage bottom process built from price/momentum evidence only.
 
-    Stage 1:
-        SELLING_PRESSURE_EASING
-
-        A meaningful bottom background exists and at least
-        one early improvement signal is appearing.
-
-    Stage 2:
-        BOTTOM_EXHAUSTION_DEVELOPING
-
-        A meaningful bottom background exists and at least
-        TWO independent improvement signals are present.
-
-    Stage 3:
-        BOTTOM_REVERSAL_CONFIRMED
-
-        Price has actually reclaimed the 4H EMA20 while
-        RSI, MACD and candle structure also improve.
-
-    This engine does NOT alter BUY scoring.
+    This engine is independent of BUY score. It does not require an
+    active BUY setup to observe early bottoming evidence.
     """
+    background_signals = []
 
-    # ============================================================
-    # BOTTOM BACKGROUND
-    # ============================================================
-    bottom_background = (
-        buy_score >= 45
-        or c4["bullish_div"]
-        or c4["ema200_distance_atr"]
+    if c4["rsi"] <= 30.0:
+        background_signals.append(
+            f"RSI is deeply oversold at {c4['rsi']:.1f}."
+        )
+    elif c4["rsi"] < 35.0:
+        background_signals.append(
+            f"RSI is depressed at {c4['rsi']:.1f}."
+        )
+
+    if (
+        c4["ema200_distance_atr"]
         <= -EXTREME_EMA200_DISTANCE_ATR
-        or c4["rsi"] < 35.0
-    )
-
-    if not bottom_background:
-        return None
-
-    # ============================================================
-    # IMPROVEMENT SIGNALS
-    # ============================================================
-    improvement_count = 0
-    reasons = []
-
-    if c4["rsi_turning_up"]:
-        improvement_count += 1
-
-        reasons.append(
-            f"RSI is starting to recover "
-            f"({c4['prev_rsi']:.1f} → {c4['rsi']:.1f})."
+    ):
+        background_signals.append(
+            f"Price is {abs(c4['ema200_distance_atr']):.1f} ATR below EMA200."
+        )
+    elif c4["ema200_distance_atr"] <= -3.5:
+        background_signals.append(
+            f"Price is extended {abs(c4['ema200_distance_atr']):.1f} ATR below EMA200."
         )
 
-    if c4["macd_hist_strengthening"]:
-        improvement_count += 1
-
-        reasons.append(
-            "MACD histogram is strengthening, showing that downward momentum is easing."
-        )
-
-    if c4["bullish_rejection"]:
-        improvement_count += 1
-
-        reasons.append(
-            "The latest 4H candle shows buyers rejecting lower prices."
+    if (
+        c4["price"] - c4["structural_low"]
+        <= 1.5 * c4["atr"]
+    ):
+        background_signals.append(
+            "Price is close to the major 4H structural low."
         )
 
     if c4["bullish_div"]:
-        improvement_count += 1
-
-        reasons.append(
-            "Price is testing weakness while momentum is stronger than before."
+        background_signals.append(
+            "Bullish divergence is present between the two latest confirmed swing lows."
         )
 
-    # ============================================================
+    bottom_background = bool(
+        background_signals
+    )
+
+    improvement_signals = []
+    reasons = []
+
+    if c4["rsi_turning_up"]:
+        improvement_signals.append(
+            "RSI is turning upward."
+        )
+        reasons.append(
+            f"RSI has started recovering ({c4['prev_rsi']:.1f} → {c4['rsi']:.1f})."
+        )
+
+    if c4["macd_hist_strengthening"]:
+        improvement_signals.append(
+            "MACD histogram is strengthening."
+        )
+        reasons.append(
+            "MACD histogram is becoming less negative / more positive."
+        )
+
+    if c4["bullish_rejection"]:
+        improvement_signals.append(
+            "Bullish rejection is present."
+        )
+        reasons.append(
+            "The latest completed 4H candle shows buyers rejecting lower prices."
+        )
+
+    if c4["bullish_div"]:
+        improvement_signals.append(
+            "Bullish divergence is present."
+        )
+        reasons.append(
+            "The two latest confirmed swing lows show lower price with higher RSI momentum."
+        )
+
+    improvement_count = len(
+        improvement_signals
+    )
+
+    # ------------------------------------------------------------
     # STAGE 3 — CONFIRMED BOTTOM REVERSAL
-    # ============================================================
+    # ------------------------------------------------------------
     reversal_confirmation = (
         c4["crossed_above_ema20"]
         and c4["rsi_turning_up"]
         and c4["macd_hist_strengthening"]
         and c4["bullish_rejection"]
         and (
-            buy_score >= 45
-            or c4["bullish_div"]
+            c4["bullish_div"]
             or c4["ema200_distance_atr"]
             <= -EXTREME_EMA200_DISTANCE_ATR
-            or c4["rsi"] < 35.0
+            or c4["rsi"] <= 30.0
         )
     )
 
     if reversal_confirmation:
         confirmed_reasons = [
-            "Price has closed back above the 4H 20-EMA.",
-            "RSI has started turning upward.",
-            "Momentum is strengthening.",
-            "The latest candle shows buyers rejecting lower prices."
+            "The completed 4H candle closed back above the 20-EMA.",
+            "RSI is turning upward.",
+            "MACD histogram is strengthening.",
+            "The latest candle shows bullish rejection."
         ]
 
         if c4["bullish_div"]:
             confirmed_reasons.append(
-                "Price and momentum are showing bullish divergence."
+                "Bullish divergence is present between confirmed swing lows."
             )
 
         return {
@@ -1876,22 +2416,34 @@ def evaluate_bottom_exhaustion(
             "reasons": confirmed_reasons
         }
 
-    # ============================================================
+    # ------------------------------------------------------------
     # STAGE 2 — DEVELOPING BOTTOM EXHAUSTION
-    # ============================================================
-    if improvement_count >= 2:
+    # ------------------------------------------------------------
+    if (
+        bottom_background
+        and improvement_count >= 2
+    ):
         return {
             "type": "BOTTOM_EXHAUSTION_DEVELOPING",
-            "reasons": reasons
+            "reasons": (
+                background_signals
+                + reasons
+            )
         }
 
-    # ============================================================
+    # ------------------------------------------------------------
     # STAGE 1 — SELLING PRESSURE EASING
-    # ============================================================
-    if improvement_count >= 1:
+    # ------------------------------------------------------------
+    if (
+        bottom_background
+        and improvement_count >= 1
+    ):
         return {
             "type": "SELLING_PRESSURE_EASING",
-            "reasons": reasons
+            "reasons": (
+                background_signals
+                + reasons
+            )
         }
 
     return None
@@ -1900,56 +2452,70 @@ def evaluate_bottom_exhaustion(
 # ================================================================
 # 4H SCORING & SETUP EVALUATION
 # ================================================================
+
 def evaluate_market_condition(
     c4,
     ob,
     d1,
     target_price_reference=None
 ):
-    p = c4["price"]
+    """
+    Evaluate all 4H spot setups.
 
+    BUY/SELL scoring remains separate from the exhaustion engines.
+    Order-book data is context only and cannot manufacture a signal.
+
+    SELL alerts are spot exit/profit-taking alerts. They do not mean shorts.
+    They are intentionally allowed even when no BUY alert was active.
+    """
+    p = c4["price"]
     ema20 = c4["ema20"]
 
-    # ============================================================
-    # ATR-NORMALIZED EMA20 STRETCH
-    #
-    # Negative = below EMA20
-    # Positive = above EMA20
-    #
-    # This replaces the previous fixed -7.5% condition.
-    # ============================================================
-    ema20_distance_atr = c4["ema20_distance_atr"]
+    ema20_distance_atr = (
+        c4["ema20_distance_atr"]
+    )
 
     active_setups = []
 
     # ============================================================
     # 1. COUNTER-TREND RELIEF SCALP
-    #
-    # IMPORTANT CHANGE:
-    # The old fixed -7.5% EMA20 threshold is replaced by
-    # a 2.5 ATR stretch.
-    #
-    # The old order-book bid >= 1.5x ask requirement has also
-    # been removed. Visible order-book imbalance is too easy
-    # to manipulate to be a hard setup requirement.
     # ============================================================
+    # This remains a bounce setup, not a long-term reversal.
+    # The old fixed -7.5% condition is replaced by ATR stretch.
+    # Volume can qualify through ratio OR historical percentile so a
+    # single normalization method cannot make the scanner blind.
+    relief_volume_ok = (
+        c4["vol_ratio"] >= RELIEF_VOLUME_RATIO_MIN
+        or c4["vol_percentile"] >= RELIEF_VOLUME_PERCENTILE
+    )
+
+    relief_bounce_confirmation = (
+        c4["bullish_rejection"]
+        or (
+            c4["rsi_turning_up"]
+            and c4["hist_slope_up"]
+            and c4["bullish_candle"]
+        )
+    )
+
     if (
         d1["is_bearish"]
-        and ema20_distance_atr <= -RELIEF_EMA20_STRETCH_ATR
+        and ema20_distance_atr
+        <= -RELIEF_EMA20_STRETCH_ATR
         and c4["rsi"] <= 28.0
-        and c4["vol_ratio"] >= 2.2
+        and relief_volume_ok
+        and relief_bounce_confirmation
     ):
-
         tp1 = ema20
 
         tp2_candidates = [
-            v
-            for v in [
+            value
+            for value in [
                 c4["ema50"],
                 c4["consolidation_high"],
                 c4["structural_high"]
             ]
-            if v > tp1
+            if value > tp1
         ]
 
         tp2 = (
@@ -1957,6 +2523,28 @@ def evaluate_market_condition(
             if tp2_candidates
             else tp1 * 1.04
         )
+
+        relief_reasons = [
+            (
+                f"Price is {abs(ema20_distance_atr):.1f} ATR below "
+                "the 4H 20-EMA."
+            ),
+            f"RSI is deeply oversold at {c4['rsi']:.1f}.",
+            (
+                f"Trading activity is elevated "
+                f"({c4['vol_ratio']:.1f}x median, "
+                f"{c4['vol_percentile']:.0f}th percentile)."
+            ),
+        ]
+
+        if c4["bullish_rejection"]:
+            relief_reasons.append(
+                "The completed 4H candle shows bullish rejection of lower prices."
+            )
+        else:
+            relief_reasons.append(
+                "RSI and MACD momentum are turning upward while the candle closes bullish."
+            )
 
         active_setups.append({
             "type": "RELIEF_SCALP",
@@ -1973,18 +2561,24 @@ def evaluate_market_condition(
             ),
             "tp1": tp1,
             "tp2": tp2,
-            "stop": c4["low"] * 0.992
+            "stop": c4["low"] * 0.992,
+            "reasons": relief_reasons,
         })
 
     # ============================================================
     # 2. ACCUMULATION IGNITION
     # ============================================================
+    ignition_volume_ok = (
+        c4["vol_ratio"] >= IGNITION_VOLUME_RATIO_MIN
+        or c4["vol_percentile"] >= IGNITION_VOLUME_PERCENTILE
+    )
+
     if (
         c4["candles_below_ema20"] >= 10
         and p > ema20
         and c4["open"] <= ema20 * 1.005
         and p >= c4["consolidation_high"] * 0.998
-        and c4["vol_ratio"] >= 1.6
+        and ignition_volume_ok
         and c4["bullish_candle"]
         and c4["upper_wick"] <= 0.25
         and (
@@ -1992,7 +2586,6 @@ def evaluate_market_condition(
             or c4["hist_slope_up"]
         )
     ):
-
         targets = select_ignition_targets(
             c4,
             reference_price=target_price_reference
@@ -2003,18 +2596,23 @@ def evaluate_market_condition(
 
             "tp1": targets["tp1"],
             "tp2": targets["tp2"],
+            "tp3": targets["tp3"],
 
             "tp1_type": targets["tp1_type"],
             "tp2_type": targets["tp2_type"],
+            "tp3_type": targets["tp3_type"],
 
             "tp1_pct": targets["tp1_pct"],
             "tp2_pct": targets["tp2_pct"],
+            "tp3_pct": targets["tp3_pct"],
 
             "tp1_atr": targets["tp1_atr"],
             "tp2_atr": targets["tp2_atr"],
+            "tp3_atr": targets["tp3_atr"],
 
             "tp1_score": targets["tp1_score"],
             "tp2_score": targets["tp2_score"],
+            "tp3_score": targets["tp3_score"],
 
             "stop": min(
                 c4["low"],
@@ -2023,27 +2621,35 @@ def evaluate_market_condition(
 
             "reasons": [
                 (
-                    f"Price spent "
-                    f"{c4['candles_below_ema20']} "
-                    f"candles below its short-term trend "
-                    f"before breaking upward."
+                    f"Breakout after "
+                    f"{c4['candles_below_ema20']} completed 4H candles "
+                    "below the 20-EMA."
                 ),
                 (
-                    f"Trading activity suddenly increased "
-                    f"({c4['vol_ratio']:.1f}x normal)."
+                    f"Trading activity increased "
+                    f"({c4['vol_ratio']:.1f}x median; "
+                    f"{c4['vol_percentile']:.0f}th percentile)."
                 ),
                 (
-                    "Price pushed back above the recent "
-                    "consolidation area."
+                    "Price reclaimed the recent consolidation high "
+                    f"near ${format_price(c4['consolidation_high'])}."
                 ),
-                "Momentum has turned upward."
+                "MACD momentum is turning upward.",
+                (
+                    f"Volume regime: {c4['volume_regime']}."
+                ),
+                (
+                    f"Compression regime: {c4['compression_regime']}."
+                ),
+                (
+                    f"Liquidity context: {ob.get('liquidity_label', 'unknown')} "
+                    f"(spread {ob.get('spread_pct', 0.0):.3f}%)."
+                ),
             ]
         })
 
     # ============================================================
-    # 3. INDEPENDENT BUY & SELL SCORING
-    #
-    # POINT VALUES ARE FROZEN.
+    # 3. FROZEN BUY / SELL SCORE ENGINES
     # ============================================================
     buy_score = 0
     exit_score = 0
@@ -2064,12 +2670,6 @@ def evaluate_market_condition(
             "Price is close to the lowest major level in the 4H lookback."
         )
 
-    # ============================================================
-    # ATR-NORMALIZED EMA200 EXTENSION
-    #
-    # The +10 score is unchanged.
-    # Only the definition of "extreme extension" changed.
-    # ============================================================
     if (
         c4["ema200_distance_atr"]
         <= -EXTREME_EMA200_DISTANCE_ATR
@@ -2077,23 +2677,22 @@ def evaluate_market_condition(
         buy_score += 10
 
         buy_factors.append(
-            f"Price is deeply extended below its long-term 4H trend "
-            f"({c4['ema200_distance_atr']:.1f} ATR below EMA200)."
+            f"Price is deeply extended below the 4H EMA200 "
+            f"({c4['ema200_distance_atr']:.1f} ATR)."
         )
 
     if c4["rsi"] < 30:
         buy_score += 15
 
         buy_factors.append(
-            f"Selling has become extreme "
-            f"(RSI {c4['rsi']:.1f})."
+            f"Selling has become extreme (RSI {c4['rsi']:.1f})."
         )
 
     if c4["bullish_div"]:
         buy_score += 15
 
         buy_factors.append(
-            "Price is showing stronger buying momentum than before."
+            "Confirmed bullish divergence is present between the two latest swing lows."
         )
 
     if c4["lower_wick"] >= 0.35:
@@ -2104,9 +2703,7 @@ def evaluate_market_condition(
         )
 
     # ------------------------------------------------------------
-    # SELL FACTORS
-    #
-    # POINT VALUES REMAIN EXACTLY THE SAME.
+    # SELL / EXIT FACTORS — FROZEN VALUES
     # ------------------------------------------------------------
     if (
         c4["structural_high"] - p
@@ -2118,11 +2715,6 @@ def evaluate_market_condition(
             "Price is close to the highest major level in the 4H lookback."
         )
 
-    # ============================================================
-    # ATR-NORMALIZED EMA200 EXTENSION
-    #
-    # The +10 score is unchanged.
-    # ============================================================
     if (
         c4["ema200_distance_atr"]
         >= EXTREME_EMA200_DISTANCE_ATR
@@ -2130,23 +2722,22 @@ def evaluate_market_condition(
         exit_score += 10
 
         exit_factors.append(
-            f"Price is deeply extended above its long-term 4H trend "
-            f"({c4['ema200_distance_atr']:.1f} ATR above EMA200)."
+            f"Price is deeply extended above the 4H EMA200 "
+            f"({c4['ema200_distance_atr']:.1f} ATR)."
         )
 
     if c4["rsi"] > 70:
         exit_score += 15
 
         exit_factors.append(
-            f"The rally is extremely stretched "
-            f"(RSI {c4['rsi']:.1f})."
+            f"The rally is extremely stretched (RSI {c4['rsi']:.1f})."
         )
 
     if c4["bearish_div"]:
         exit_score += 15
 
         exit_factors.append(
-            "Price is pushing higher while momentum is becoming weaker."
+            "Confirmed bearish divergence is present between the two latest swing highs."
         )
 
     if c4["upper_wick"] >= 0.35:
@@ -2156,22 +2747,10 @@ def evaluate_market_condition(
             "Sellers strongly rejected higher prices."
         )
 
-    # ============================================================
-    # ORDER BOOK
-    #
-    # REMOVED FROM CORE BUY/SELL SCORING.
-    #
-    # Previously:
-    #   bid > 1.3x ask = +10 BUY
-    #   ask > 1.3x bid = +10 SELL
-    #
-    # Those points are intentionally gone because a single
-    # displayed order-book snapshot can be spoofed/cancelled.
-    #
-    # Order book remains available as context in alerts and the
-    # manual direction report, but it cannot manufacture a
-    # BUY_CONFIRMED / BUY_EARLY / top score.
-    # ============================================================
+    # ------------------------------------------------------------
+    # ORDER BOOK IS CONTEXT ONLY
+    # ------------------------------------------------------------
+    # No bid/ask imbalance points are added here.
 
     # ------------------------------------------------------------
     # 1D BEARISH PENALTY
@@ -2182,9 +2761,9 @@ def evaluate_market_condition(
             buy_score - 25
         )
 
-    # ------------------------------------------------------------
+    # ============================================================
     # BUY ALERTS
-    # ------------------------------------------------------------
+    # ============================================================
     if buy_score >= 65:
         active_setups.append({
             "type": "BUY_CONFIRMED",
@@ -2200,74 +2779,49 @@ def evaluate_market_condition(
         })
 
     # ============================================================
-    # TOP EXHAUSTION
+    # SELL / EXIT ALERTS
+    #
+    # IMPORTANT:
+    # These are independent of active BUY state. They are spot
+    # profit-taking / reduction alerts, not short-entry alerts.
+    # ============================================================
+    if exit_score >= 65:
+        active_setups.append({
+            "type": "SELL_CONFIRMED",
+            "score": exit_score,
+            "reasons": exit_factors
+        })
+
+    elif exit_score >= 45:
+        active_setups.append({
+            "type": "SELL_EARLY",
+            "score": exit_score,
+            "reasons": exit_factors
+        })
+
+    # ============================================================
+    # TOP EXHAUSTION — INDEPENDENT OF SELL SCORE
     # ============================================================
     top_setup = evaluate_top_exhaustion(
-        c4,
-        exit_score
+        c4
     )
 
     if top_setup is not None:
-
-        if (
-            top_setup["type"]
-            == "TOP_REVERSAL_CONFIRMED"
-        ):
-            active_setups.append(
-                top_setup
-            )
-
-        elif (
-            top_setup["type"]
-            == "TOP_EXHAUSTION_DEVELOPING"
-        ):
-            top_setup["score"] = exit_score
-
-            active_setups.append(
-                top_setup
-            )
-
-        elif (
-            top_setup["type"]
-            == "RALLY_OVERHEATING"
-        ):
-            top_setup["score"] = exit_score
-            top_setup["reasons"] = exit_factors
-
-            active_setups.append(
-                top_setup
-            )
+        active_setups.append(
+            top_setup
+        )
 
     # ============================================================
-    # BOTTOM EXHAUSTION
-    #
-    # This does not modify buy_score.
+    # BOTTOM EXHAUSTION — INDEPENDENT OF BUY SCORE
     # ============================================================
     bottom_setup = evaluate_bottom_exhaustion(
-        c4,
-        buy_score
+        c4
     )
 
     if bottom_setup is not None:
-
-        if bottom_setup["type"] == "BOTTOM_REVERSAL_CONFIRMED":
-            active_setups.append(
-                bottom_setup
-            )
-
-        elif bottom_setup["type"] == "BOTTOM_EXHAUSTION_DEVELOPING":
-            bottom_setup["score"] = buy_score
-
-            active_setups.append(
-                bottom_setup
-            )
-
-        elif bottom_setup["type"] == "SELLING_PRESSURE_EASING":
-            bottom_setup["score"] = buy_score
-
-            active_setups.append(
-                bottom_setup
-            )
+        active_setups.append(
+            bottom_setup
+        )
 
     return active_setups
 
@@ -2348,6 +2902,7 @@ def get_dynamic_movers():
 # ================================================================
 # MAIN CONTROLLER
 # ================================================================
+
 def check_4h_market():
     logger.info(
         "Initializing 4H Tactical Scanner..."
@@ -2371,7 +2926,7 @@ def check_4h_market():
 
     manual_summary = (
         "🧭 *[MANUAL 4H MARKET DIRECTION REPORT]* 🧭\n"
-        "_Where prices are likely heading from current levels:_\n\n"
+        "_Direction uses completed 4H candles; live order-book data is context only._\n\n"
     )
 
     for symbol in full_watchlist:
@@ -2382,7 +2937,7 @@ def check_4h_market():
 
         try:
             # ====================================================
-            # 4H TECHNICAL DATA
+            # COMPLETED 4H DATA
             # ====================================================
             c4 = fetch_4h_data(
                 symbol
@@ -2399,11 +2954,15 @@ def check_4h_market():
                 live_price = c4["price"]
 
             # ====================================================
-            # ORDER BOOK
+            # ORDER BOOK — CONTEXT ONLY
             # ====================================================
             ob = fetch_order_book(
                 symbol,
-                live_price
+                live_price,
+                c4.get(
+                    "avg_quote_volume_4h",
+                    0.0
+                )
             )
 
             # ====================================================
@@ -2433,14 +2992,11 @@ def check_4h_market():
             # MANUAL DIRECTION REPORT
             # ====================================================
             if RUN_MODE != "schedule":
-
-                verdict, action_note = (
-                    analyze_market_direction(
-                        c4,
-                        ob,
-                        d1,
-                        live_price=live_price
-                    )
+                verdict, action_note = analyze_market_direction(
+                    c4,
+                    ob,
+                    d1,
+                    live_price=live_price
                 )
 
                 manual_summary += (
@@ -2450,7 +3006,7 @@ def check_4h_market():
                 )
 
             # ====================================================
-            # CHECK SETUPS
+            # SETUPS
             # ====================================================
             setups = evaluate_market_condition(
                 c4,
@@ -2460,21 +3016,33 @@ def check_4h_market():
             )
 
             # ====================================================
-            # SEND ALERTS
+            # TELEGRAM ALERTS
             # ====================================================
             for setup in setups:
-
                 stype = setup["type"]
 
                 alerts_fired += 1
+
+                reasons = setup.get(
+                    "reasons",
+                    []
+                )
+
+                reasons_text = (
+                    "• "
+                    + "\n• ".join(
+                        reasons
+                    )
+                    if reasons
+                    else "• No additional explanatory factors."
+                )
 
                 # =================================================
                 # RELIEF SCALP
                 # =================================================
                 if stype == "RELIEF_SCALP":
-
                     msg = (
-                        "⚡ *SHORT-TERM BOUNCE ALERT* : "
+                        "⚡ *4H SHORT-TERM BOUNCE ALERT* : "
                         f"{coin_name}\n\n"
 
                         f"• *Current Price:* "
@@ -2483,97 +3051,93 @@ def check_4h_market():
                         f"• *4H Candle Close:* "
                         f"${completed_4h_str}\n"
 
-                        f"• 🛡️ *Strongest Visible Buy Support:* "
+                        f"• 🛡️ *Largest Visible Bid Wall:* "
                         f"${support_str}\n"
 
-                        f"• 📉 *Price is:* "
-                        f"{abs(setup['ema_stretch']):.1f}% "
-                        f"below the 4H 20-EMA\n"
+                        f"• 📉 *Distance below 4H 20-EMA:* "
+                        f"{abs(setup['ema_stretch']):.1f}%\n"
 
                         f"• 📏 *EMA20 Distance:* "
                         f"{setup['ema_stretch_atr']:.1f} ATR\n"
 
-                        f"• ⚡ *RSI:* "
+                        f"• ⚡ *4H RSI:* "
                         f"{c4['rsi']:.1f}\n"
 
-                        f"• 📊 *Trading Activity:* "
-                        f"{c4['vol_ratio']:.1f}x normal\n\n"
+                        f"• 📊 *Volume:* "
+                        f"{c4['vol_ratio']:.1f}x median | "
+                        f"{c4['vol_percentile']:.0f}th percentile\n\n"
 
                         "*Why the bot flagged this:*\n"
-                        "• Price has fallen unusually far relative to this coin's normal 4H movement.\n"
-                        "• Sellers may be exhausted.\n"
-                        "• Trading activity has become unusually strong.\n"
-                        "• The daily trend is still weak, so this is a bounce setup rather than a confirmed long-term reversal.\n\n"
+                        f"{reasons_text}\n\n"
 
                         "*Possible bounce levels:*\n"
-
-                        f"• 🎯 *Target 1:* "
+                        f"• 🎯 *TP1:* "
                         f"${format_price(setup['tp1'])} "
-                        "(short-term trend)\n"
-
-                        f"• 🎯 *Target 2:* "
+                        "(4H 20-EMA retest)\n"
+                        f"• 🎯 *TP2:* "
                         f"${format_price(setup['tp2'])}\n"
-
                         f"• 🛑 *Invalidation:* "
                         f"4H close below "
                         f"${format_price(setup['stop'])}\n\n"
 
-                        "📍 *What to do:* "
-                        "This is a short-term bounce warning. "
-                        "Open the chart and check whether buyers are actually holding support."
+                        "📍 *Meaning:* This is a short-term spot bounce setup. "
+                        "The daily trend is still bearish; this is not a claim that "
+                        "the larger downtrend has ended."
                     )
 
                 # =================================================
                 # ACCUMULATION IGNITION
                 # =================================================
                 elif stype == "ACCUMULATION_IGNITION":
-
                     msg = (
-                        "🚀 *BUYING MOMENTUM BUILDING* : "
+                        "🚀 *4H ACCUMULATION IGNITION* : "
                         f"{coin_name}\n\n"
 
                         f"• *Current Price:* "
                         f"${p_str}\n"
 
-                        f"• *4H Candle Close:* "
-                        f"${completed_4h_str}\n"
+                        f"• 📈 *Ignition Volume:* "
+                        f"{c4['vol_ratio']:.1f}x median | "
+                        f"{c4['vol_percentile']:.0f}th percentile "
+                        f"({c4['volume_regime']})\n"
 
-                        f"• 📈 *Trading Activity:* "
-                        f"{c4['vol_ratio']:.1f}x normal\n"
+                        f"• ⏳ *Suppression:* "
+                        f"{c4['candles_below_ema20']} candles "
+                        f"({c4['candles_below_ema20'] * 4}h) "
+                        "below 20-EMA\n"
 
-                        f"• ⏳ *Time Spent Below Short-Term Trend:* "
-                        f"{c4['candles_below_ema20']} "
-                        f"candles "
-                        f"({c4['candles_below_ema20'] * 4}h)\n"
+                        f"• 🛡️ *Largest Visible Bid Wall:* "
+                        f"${support_str}\n"
 
-                        f"• 🛡️ *Visible Buy Support:* "
-                        f"${support_str}\n\n"
+                        f"• 💧 *Liquidity Context:* "
+                        f"{ob.get('liquidity_label', 'unknown')} | "
+                        f"Spread {ob.get('spread_pct', 0.0):.3f}%\n\n"
 
                         "*Why the bot flagged this:*\n"
-                        "• Price spent a long time weak before moving upward.\n"
-                        "• Trading activity suddenly increased.\n"
-                        "• Buyers pushed price back above the recent range.\n"
-                        "• Momentum has turned upward.\n\n"
+                        f"{reasons_text}\n\n"
 
-                        "*Possible upside levels:*\n"
-
-                        f"• 🎯 *Target 1:* "
+                        "*Tactical Target Map:*\n"
+                        f"• 🎯 *TP1:* "
                         f"${format_price(setup['tp1'])} "
                         f"({setup['tp1_type']} | "
                         f"+{setup['tp1_pct']:.1f}%)\n"
 
-                        f"• 🎯 *Target 2:* "
+                        f"• 🎯 *TP2:* "
                         f"${format_price(setup['tp2'])} "
                         f"({setup['tp2_type']} | "
                         f"+{setup['tp2_pct']:.1f}%)\n"
+
+                        f"• 🎯 *TP3:* "
+                        f"${format_price(setup['tp3'])} "
+                        f"({setup['tp3_type']} | "
+                        f"+{setup['tp3_pct']:.1f}%)\n"
 
                         f"• 🛑 *Invalidation:* "
                         f"4H close below "
                         f"${format_price(setup['stop'])}\n\n"
 
-                        "📍 *What to do:* "
-                        "Open the chart and check whether the breakout is holding. "
-                        "This is a spot-buying setup, not a guarantee of continuation."
+                        "📍 *Meaning:* This is a spot breakout/continuation setup. "
+                        "Targets are resistance areas, not guaranteed prices."
                     )
 
                 # =================================================
@@ -2583,27 +3147,20 @@ def check_4h_market():
                     "BUY_CONFIRMED",
                     "BUY_EARLY"
                 ]:
-
                     if stype == "BUY_CONFIRMED":
-
                         header = (
                             "🟢 *STRONG BUYING SIGNAL*"
                         )
-
-                        intro = (
-                            "Several signs are lining up that "
-                            "buyers may be taking control."
+                        meaning = (
+                            "Multiple scoring conditions agree."
                         )
-
                     else:
-
                         header = (
                             "🟡 *EARLY BUYING WARNING*"
                         )
-
-                        intro = (
-                            "Some signs suggest that buyers "
-                            "may be starting to take control."
+                        meaning = (
+                            "Some bottom/entry conditions are present, "
+                            "but confirmation is incomplete."
                         )
 
                     msg = (
@@ -2618,34 +3175,94 @@ def check_4h_market():
                         f"• 🛡️ *Visible Buy Support:* "
                         f"${support_str}\n"
 
-                        f"• 💧 *Visible Sell Orders Within 1%:* "
+                        f"• 💧 *Visible Sell Liquidity Within 1%:* "
                         f"${ob['ask_depth_1pct']:,.0f}\n"
 
-                        f"• 🌍 *Daily RSI:* "
-                        f"{d1['rsi']:.1f}\n\n"
+                        f"• ⚡ *4H RSI:* "
+                        f"{c4['rsi']:.1f}\n"
 
-                        f"*What this means:*\n"
-                        f"• {intro}\n\n"
+                        f"• 📊 *BUY Score:* "
+                        f"{setup['score']}\n"
+
+                        f"• 📈 *Volume Regime:* "
+                        f"{c4['volume_regime']} "
+                        f"({c4['vol_percentile']:.0f}th percentile)\n"
+
+                        f"• 💧 *Liquidity:* "
+                        f"{ob.get('liquidity_label', 'unknown')} | "
+                        f"Spread {ob.get('spread_pct', 0.0):.3f}%\n\n"
 
                         "*Why the bot flagged this:*\n"
-                        "• "
-                        + "\n• ".join(
-                            setup["reasons"]
-                        )
-                        + "\n\n"
+                        f"{reasons_text}\n\n"
 
-                        "📍 *What to do:* "
-                        "Open the chart and check support, candle structure "
-                        "and whether buyers are actually following through."
+                        f"📍 *Meaning:* {meaning}\n"
+                        "This is a spot-buying signal, not a guarantee that price cannot fall."
+                    )
+
+                # =================================================
+                # SELL / EXIT ALERTS
+                # =================================================
+                elif stype in [
+                    "SELL_CONFIRMED",
+                    "SELL_EARLY"
+                ]:
+                    if stype == "SELL_CONFIRMED":
+                        header = (
+                            "🔴 *SELL / PROFIT-TAKING ALERT*"
+                        )
+                        meaning = (
+                            "The frozen sell score is strongly elevated. "
+                            "For spot holdings, this is an exit/reduction warning."
+                        )
+                    else:
+                        header = (
+                            "🟠 *EARLY SELL / PROFIT-TAKING WARNING*"
+                        )
+                        meaning = (
+                            "Several sell-side conditions are present, but "
+                            "this is earlier evidence rather than a confirmed reversal."
+                        )
+
+                    msg = (
+                        f"{header} : {coin_name}\n\n"
+
+                        f"• *Current Price:* "
+                        f"${p_str}\n"
+
+                        f"• *4H Candle Close:* "
+                        f"${completed_4h_str}\n"
+
+                        f"• 🎯 *Visible Sell Area:* "
+                        f"${resist_str}\n"
+
+                        f"• ⚡ *4H RSI:* "
+                        f"{c4['rsi']:.1f}\n"
+
+                        f"• 📊 *SELL Score:* "
+                        f"{setup['score']}\n"
+
+                        f"• 📈 *Volume:* "
+                        f"{c4['vol_ratio']:.1f}x median | "
+                        f"{c4['vol_percentile']:.0f}th percentile\n"
+
+                        f"• 💧 *Liquidity:* "
+                        f"{ob.get('liquidity_label', 'unknown')} | "
+                        f"Spread {ob.get('spread_pct', 0.0):.3f}%\n\n"
+
+                        "*Why the bot flagged this:*\n"
+                        f"{reasons_text}\n\n"
+
+                        f"📍 *Meaning:* {meaning}\n"
+                        "This is a spot exit/profit-taking alert, not a short-entry signal. "
+                        "It can fire even if there was no earlier BUY alert."
                     )
 
                 # =================================================
                 # RALLY OVERHEATING
                 # =================================================
                 elif stype == "RALLY_OVERHEATING":
-
                     msg = (
-                        f"🟠 *RALLY RUNNING HOT* : "
+                        "🟠 *RALLY RUNNING HOT* : "
                         f"{coin_name}\n\n"
 
                         f"• *Current Price:* "
@@ -2657,40 +3274,26 @@ def check_4h_market():
                         f"• 🎯 *Visible Sell Area:* "
                         f"${resist_str}\n"
 
-                        f"• 💧 *Visible Buy Orders Within 1%:* "
-                        f"${ob['bid_depth_1pct']:,.0f}\n"
-
                         f"• ⚡ *4H RSI:* "
-                        f"{c4['rsi']:.1f}\n\n"
+                        f"{c4['rsi']:.1f}\n"
 
-                        "*What this means:*\n"
-                        "• Price has moved up very strongly.\n"
-                        "• The move is becoming stretched.\n"
-                        "• Visible order-book liquidity is shown only as context and is not used to create the alert.\n"
-                        "• This does NOT mean the rally is over.\n\n"
+                        f"• 📏 *EMA200 Extension:* "
+                        f"{c4['ema200_distance_atr']:+.1f} ATR\n\n"
 
-                        "*Why the bot flagged this:*\n"
-                        "• "
-                        + "\n• ".join(
-                            setup["reasons"]
-                        )
-                        + "\n\n"
+                        "*Why the bot is warning:*\n"
+                        f"{reasons_text}\n\n"
 
-                        "⚠️ *Important:* "
-                        "This is a WARNING, not a sell signal and not a confirmed top.\n\n"
-
-                        "📍 *What to do:* "
-                        "Open the chart and watch for an actual loss of momentum "
-                        "or a reversal before making a decision."
+                        "⚠️ *Important:* This is an overheating warning, "
+                        "not proof that the rally is over and not a standalone "
+                        "short-entry signal."
                     )
 
                 # =================================================
                 # TOP EXHAUSTION DEVELOPING
                 # =================================================
                 elif stype == "TOP_EXHAUSTION_DEVELOPING":
-
                     msg = (
-                        f"🟡 *TOP EXHAUSTION DEVELOPING* : "
+                        "🟡 *TOP EXHAUSTION DEVELOPING* : "
                         f"{coin_name}\n\n"
 
                         f"• *Current Price:* "
@@ -2704,36 +3307,27 @@ def check_4h_market():
 
                         f"• ⚡ *4H RSI:* "
                         f"{c4['rsi']:.1f} "
-                        f"(previously {c4['prev_rsi']:.1f})\n\n"
+                        f"(previous {c4['prev_rsi']:.1f})\n"
 
-                        "*What this means:*\n"
-                        "• The rally is still alive, but buyers are starting to lose strength.\n"
-                        "• Momentum has begun weakening.\n"
-                        "• The latest price action is showing some selling/rejection.\n"
-                        "• This is more serious than simply having an overextended price.\n\n"
+                        f"• 📉 *MACD Histogram:* "
+                        f"{'weakening' if c4['macd_hist_weakening'] else 'not weakening'}\n"
+
+                        f"• 🕯️ *Rejection:* "
+                        f"{'present' if c4['bearish_rejection'] else 'not present'}\n\n"
 
                         "*What the bot sees:*\n"
-                        "• "
-                        + "\n• ".join(
-                            setup["reasons"]
-                        )
-                        + "\n\n"
+                        f"{reasons_text}\n\n"
 
-                        "⚠️ *Important:* "
-                        "This is still NOT a confirmed reversal.\n\n"
-
-                        "📍 *What to do:* "
-                        "Open the chart and watch whether price actually breaks back below "
-                        "its short-term trend."
+                        "⚠️ *Important:* This is not yet a confirmed 4H reversal. "
+                        "For spot holders it is a profit-management/caution alert."
                     )
 
                 # =================================================
                 # TOP REVERSAL CONFIRMED
                 # =================================================
                 elif stype == "TOP_REVERSAL_CONFIRMED":
-
                     msg = (
-                        f"🔴 *TOP REVERSAL CONFIRMED* : "
+                        "🔴 *TOP REVERSAL CONFIRMED* : "
                         f"{coin_name}\n\n"
 
                         f"• *Current Price:* "
@@ -2742,44 +3336,35 @@ def check_4h_market():
                         f"• *4H Candle Close:* "
                         f"${completed_4h_str}\n"
 
-                        f"• 📉 *4H 20-EMA:* "
-                        f"${format_price(c4['ema20'])}\n"
+                        f"• 📉 *20-EMA Transition:* "
+                        "Closed below 20-EMA\n"
 
                         f"• ⚡ *4H RSI:* "
-                        f"{c4['rsi']:.1f}\n"
+                        f"{c4['rsi']:.1f} and turning down\n"
+
+                        f"• 📉 *MACD Histogram:* "
+                        "weakening\n"
+
+                        f"• 🕯️ *Bearish Rejection:* "
+                        "present\n"
 
                         f"• 🎯 *Visible Sell Area:* "
                         f"${resist_str}\n\n"
 
-                        "*What this means:*\n"
-                        "• The price has now fallen back below its short-term trend.\n"
-                        "• Momentum is weakening.\n"
-                        "• RSI is turning downward.\n"
-                        "• The latest 4H candle shows sellers gaining control.\n\n"
-
                         "*Why the bot flagged this:*\n"
-                        "• "
-                        + "\n• ".join(
-                            setup["reasons"]
-                        )
-                        + "\n\n"
+                        f"{reasons_text}\n\n"
 
-                        "🔴 *This is different from the earlier warning:* "
-                        "the bot is no longer saying only that the rally is stretched. "
-                        "It is now seeing actual reversal evidence.\n\n"
-
-                        "📍 *What to do:* "
-                        "This is the alert to open the chart and review profit-taking "
-                        "or risk management for existing spot holdings."
+                        "📍 *Meaning:* The completed 4H candle now shows a "
+                        "reversal structure. This is a spot profit-protection "
+                        "signal, not a short-entry signal."
                     )
 
                 # =================================================
                 # SELLING PRESSURE EASING
                 # =================================================
                 elif stype == "SELLING_PRESSURE_EASING":
-
                     msg = (
-                        f"🔵 *SELLING PRESSURE EASING* : "
+                        "🔵 *SELLING PRESSURE EASING* : "
                         f"{coin_name}\n\n"
 
                         f"• *Current Price:* "
@@ -2795,34 +3380,21 @@ def check_4h_market():
                         f"{c4['rsi']:.1f}\n"
 
                         f"• 📊 *Volume:* "
-                        f"{c4['vol_ratio']:.1f}x normal\n\n"
-
-                        "*What this means:*\n"
-                        "• The decline is showing its first signs of losing pressure.\n"
-                        "• Buyers are beginning to respond at lower prices.\n"
-                        "• This is an early observation, not a confirmed bottom.\n\n"
+                        f"{c4['vol_ratio']:.1f}x median\n\n"
 
                         "*What the bot sees:*\n"
-                        "• "
-                        + "\n• ".join(
-                            setup["reasons"]
-                        )
-                        + "\n\n"
+                        f"{reasons_text}\n\n"
 
-                        "⚠️ *Important:* "
-                        "Price can continue falling even after this warning.\n\n"
-
-                        "📍 *What to do:* "
-                        "Watch whether the improvement continues on the next completed 4H candle."
+                        "⚠️ *Important:* Early bottoming evidence is not a confirmed reversal. "
+                        "Price can continue lower."
                     )
 
                 # =================================================
                 # BOTTOM EXHAUSTION DEVELOPING
                 # =================================================
                 elif stype == "BOTTOM_EXHAUSTION_DEVELOPING":
-
                     msg = (
-                        f"🟡 *BOTTOM EXHAUSTION DEVELOPING* : "
+                        "🟡 *BOTTOM EXHAUSTION DEVELOPING* : "
                         f"{coin_name}\n\n"
 
                         f"• *Current Price:* "
@@ -2836,35 +3408,24 @@ def check_4h_market():
 
                         f"• ⚡ *4H RSI:* "
                         f"{c4['rsi']:.1f} "
-                        f"(previously {c4['prev_rsi']:.1f})\n\n"
+                        f"(previous {c4['prev_rsi']:.1f})\n"
 
-                        "*What this means:*\n"
-                        "• The decline is showing multiple signs of losing strength.\n"
-                        "• Buyers are responding more strongly than before.\n"
-                        "• Momentum is beginning to improve.\n"
-                        "• This is stronger evidence than a simple oversold reading.\n\n"
+                        f"• 📈 *MACD Histogram:* "
+                        f"{'strengthening' if c4['macd_hist_strengthening'] else 'not strengthening'}\n\n"
 
                         "*What the bot sees:*\n"
-                        "• "
-                        + "\n• ".join(
-                            setup["reasons"]
-                        )
-                        + "\n\n"
+                        f"{reasons_text}\n\n"
 
-                        "⚠️ *Important:* "
-                        "This is NOT a confirmed reversal yet.\n\n"
-
-                        "📍 *What to do:* "
-                        "Watch whether price can reclaim and hold its short-term trend."
+                        "⚠️ *Important:* This is developing bottom evidence, "
+                        "not a confirmed reversal yet."
                     )
 
                 # =================================================
                 # BOTTOM REVERSAL CONFIRMED
                 # =================================================
                 elif stype == "BOTTOM_REVERSAL_CONFIRMED":
-
                     msg = (
-                        f"🟢 *BOTTOM REVERSAL CONFIRMED* : "
+                        "🟢 *BOTTOM REVERSAL CONFIRMED* : "
                         f"{coin_name}\n\n"
 
                         f"• *Current Price:* "
@@ -2873,37 +3434,35 @@ def check_4h_market():
                         f"• *4H Candle Close:* "
                         f"${completed_4h_str}\n"
 
-                        f"• 📈 *4H 20-EMA:* "
-                        f"${format_price(c4['ema20'])}\n"
+                        f"• 📈 *20-EMA Transition:* "
+                        "Closed above 20-EMA\n"
 
                         f"• ⚡ *4H RSI:* "
-                        f"{c4['rsi']:.1f}\n"
+                        f"{c4['rsi']:.1f} and turning up\n"
+
+                        f"• 📈 *MACD Histogram:* "
+                        "strengthening\n"
+
+                        f"• 🕯️ *Bullish Rejection:* "
+                        "present\n"
 
                         f"• 🛡️ *Visible Buy Support:* "
                         f"${support_str}\n\n"
 
-                        "*What this means:*\n"
-                        "• Price has reclaimed the short-term 4H trend.\n"
-                        "• RSI is turning upward.\n"
-                        "• Momentum is strengthening.\n"
-                        "• Buyers are showing rejection of lower prices.\n\n"
-
                         "*Why the bot flagged this:*\n"
-                        "• "
-                        + "\n• ".join(
-                            setup["reasons"]
-                        )
-                        + "\n\n"
+                        f"{reasons_text}\n\n"
 
-                        "⚠️ *Important:* "
-                        "This confirms reversal evidence, not a guaranteed continuation.\n\n"
-
-                        "📍 *What to do:* "
-                        "Open the chart and check whether price can hold above the 4H 20-EMA "
-                        "and continue making higher lows."
+                        "📍 *Meaning:* The completed 4H candle now shows a "
+                        "bottom-reversal structure. This is evidence of reversal, "
+                        "not a guarantee of continuation."
                     )
 
                 else:
+                    # Keep the scanner alive if a future setup type is added
+                    # without a matching Telegram formatter.
+                    logger.warning(
+                        f"Unhandled setup type for {symbol}: {stype}"
+                    )
                     continue
 
                 send_telegram(
@@ -2913,9 +3472,11 @@ def check_4h_market():
                 time.sleep(1.0)
 
         except Exception as e:
-
             logger.error(
                 f"Failed 4H analysis for {symbol}: {e}"
+            )
+            logger.debug(
+                traceback.format_exc()
             )
 
             continue
@@ -2924,7 +3485,6 @@ def check_4h_market():
     # MANUAL REPORT
     # ============================================================
     if RUN_MODE != "schedule":
-
         manual_summary += (
             "──────────────\n"
             "✅ *Scan Complete.* "
